@@ -15,9 +15,8 @@ INMP441 -> ESP32 -> USB serial -> capture.py -> WAV -> analyze.py
 pip install -r tools/audio/requirements.txt
 ```
 
-`sounddevice` is only needed for `visualize.py --play`; everything else
-works without it, and the viewer says so instead of failing if PortAudio
-is missing. `fastapi` and `uvicorn` are only needed for `backend/`.
+`fastapi` and `uvicorn` are only needed for `backend/`; the
+command-line tools work without them.
 
 The firmware must be the one in `src/main.cpp`. Copy the credentials
 template before the first build, or the compile stops with a message
@@ -43,7 +42,7 @@ overruns whenever they happen.
 
 ```
 python tools/audio/capture.py 192.168.1.50 --label off --seconds 30
-python tools/audio/visualize.py 192.168.1.50:3333 --play
+python tools/audio/visualize.py 192.168.1.50:3333
 python tools/audio/classify_live.py 192.168.1.50
 ```
 
@@ -109,43 +108,10 @@ readout, colour-coded, with the candidate and how long it has held.
 `classify_live.py` are accepted, so a rule can be tried against the
 real air conditioner while watching the spectrum that produced it.
 
-```
-python tools/audio/visualize.py COM9 --play
-python tools/audio/visualize.py COM9 --play --gain-db 30
-python tools/audio/visualize.py --audio-test
-python tools/audio/visualize.py --list-audio-devices
-```
-
-Playback is **off unless you pass `--play`**. The readout always says
-which it is — `audio off`, `audio ON` with buffer statistics, or
-`audio FAILED` with the reason — so a window that is silent is never
-ambiguous.
-
-`--audio-test` plays a 440 Hz tone through the same playback path and
-needs no ESP32. It is written at about the level the microphone
-reaches and amplified by the same `--gain-db`, so it answers the
-question silence cannot: if you hear the tone, playback works and any
-later silence is the signal, not the path.
-
-`--play` sends the audio to the speakers, which is often the fastest
-way to tell what a band is actually picking up. The microphone runs
-tens of dB below full scale, so playback is amplified (`--gain-db`,
-24 dB by default) — that is a listening aid, not a calibrated monitor,
-and the readout counts clipped samples. **Use headphones** if the
-microphone can hear the speakers, or it will feed back.
-
-Playback never blocks the serial reader. Samples go into a ring buffer
-that PortAudio's own callback thread drains, so a sound card that
-falls behind cannot stall the reader and start losing frames. The
-ESP32's clock and the sound card's are independent and will drift: if
-the card runs slow the oldest audio is dropped, if it runs fast the
-callback emits silence. The readout reports both, because a large
-count means what you are hearing is not continuous.
-
-Audio and the classifier are both fed from the reader thread, not from
-the plot. The plot queue drops frames when a redraw falls behind,
-which would put holes in the audio and corrupt the classifier's
-rolling median and hold timing.
+The classifier is fed from the reader thread, not from the plot. The
+plot queue drops frames when a redraw falls behind, which would
+corrupt the classifier's rolling median and hold timing; it needs
+every frame, in order.
 
 ## Collecting a dataset
 
@@ -374,7 +340,7 @@ Only then is it worth asking whether `arduinoFFT` should become
 | --- | --- |
 | `acstream.py` | the wire protocol, shared by capture and visualize |
 | `capture.py` | serial -> WAV |
-| `visualize.py` | serial -> live plots, classifier and playback |
+| `visualize.py` | live plots and classifier |
 | `analyze.py` | WAV -> feature tables and plots |
 | `classify_live.py` | serial -> live OFF / FAN / COMPRESSOR |
 | `recordings/` | captured WAVs, the inputs (git-ignored except `.gitkeep`) |

@@ -2,7 +2,6 @@ pyserial
 numpy
 scipy
 matplotlib
-sounddevice
 
 # backend/ only
 fastapi
