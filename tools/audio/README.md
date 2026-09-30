@@ -17,7 +17,7 @@ pip install -r tools/audio/requirements.txt
 
 `sounddevice` is only needed for `visualize.py --play`; everything else
 works without it, and the viewer says so instead of failing if PortAudio
-is missing.
+is missing. `fastapi` and `uvicorn` are only needed for `backend/`.
 
 The firmware must be the one in `src/main.cpp`. Copy the credentials
 template before the first build, or the compile stops with a message
@@ -291,6 +291,72 @@ is ~1.4 dB for a fan and ~9.8 dB for speech, which separates the
 failing case far better than any level does. Spectral tilt
 (1500–4000 minus 200–1200) does **not** work — it is at chance.
 
+## Backend and web UI
+
+```
+python tools/audio/backend/app.py --target 192.168.1.50:3333
+```
+
+```
+Backend starting
+ESP32: 192.168.1.50:3333
+stream: connected to 192.168.1.50:3333 (16000 Hz, 512 samples/frame)
+Web: http://127.0.0.1:8000
+```
+
+A long-running local service that is **the only TCP client** the ESP32
+has. It owns reception, feature extraction, classification, runtime
+config and event recording. The browser displays and configures; it
+never classifies and never talks to the ESP32.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/status` | stream health, state, features, config |
+| `GET /api/config` | current thresholds and timings |
+| `PATCH /api/config` | change them live |
+| `GET /api/events` | recorded transitions, newest first |
+| `GET /api/events/{id}/audio` | that event's WAV |
+| `WS /ws/live` | snapshots, 5 Hz by default |
+
+The classifier runs at the full window rate (~31/s); only the UI
+updates are throttled. Raw PCM never leaves the backend.
+
+`PATCH /api/config` applies at once without touching the TCP
+connection. The published state is kept — moving a threshold is not an
+observation — but the rolling median and the candidate are cleared, so
+the hold has to be earned again under the new rules.
+
+### Transition events
+
+A **published** state change writes two files to `results/events/`:
+
+```
+2026-09-30_130533_FAN_to_COMPRESSOR.wav     raw evidence
+2026-09-30_130533_FAN_to_COMPRESSOR.json    decision summary
+```
+
+15 s before and 15 s after, unmodified PCM in the same 32-bit format
+`capture.py` writes, so `analyze.py` and `classify_live.py --replay`
+read them directly. The JSON holds the features at the transition, the
+decision-window statistics, how long the candidate held, and the exact
+config in force at the time. Overlapping captures are independent: a
+second transition during the first's tail starts its own event.
+
+The classifier's *first* verdict after startup is not a transition and
+is not recorded — it is the classifier settling, not a change.
+
+Note that a transition publishes `holdSeconds` after the audio really
+changed, so that much of the pre-roll is already the new state. At the
+defaults (15 s pre-roll against a 2.5 s decision) there is plenty of
+genuine "before"; raising `holdSeconds` towards `eventPreSeconds` eats
+into it.
+
+### Not built yet
+
+SQLite history, the replay API and the events/history/replay browser
+pages are later phases. `classify_live.py --replay` covers replay from
+the command line in the meantime.
+
 ## Deciding what goes back into the firmware
 
 Read the separation table and the per-state spectra before writing any
@@ -312,4 +378,6 @@ Only then is it worth asking whether `arduinoFFT` should become
 | `analyze.py` | WAV -> feature tables and plots |
 | `classify_live.py` | serial -> live OFF / FAN / COMPRESSOR |
 | `recordings/` | captured WAVs, the inputs (git-ignored except `.gitkeep`) |
-| `results/` | everything generated: `features.csv`, `plots/`, `live.csv`, `replay.csv` |
+| `backend/` | the local service: stream, classifier, config, events, API |
+| `web/` | the browser UI it serves |
+| `results/` | everything generated: `events/`, `plots/`, `features.csv`, … |

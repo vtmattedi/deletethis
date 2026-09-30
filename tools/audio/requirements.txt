@@ -3,3 +3,7 @@ numpy
 scipy
 matplotlib
 sounddevice
+
+# backend/ only
+fastapi
+uvicorn[standard]

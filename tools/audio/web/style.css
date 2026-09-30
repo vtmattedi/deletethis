@@ -1,0 +1,55 @@
+:root {
+  --bg: #12141a; --card: #1b1e26; --line: #2c313d;
+  --text: #e7e9ee; --dim: #949bab;
+  --off: #3b7dd8; --fan: #1f9d55; --compressor: #d2691e; --bad: #d64545;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+}
+header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 16px 20px; border-bottom: 1px solid var(--line);
+}
+h1 { font-size: 16px; margin: 0; font-weight: 600; }
+h2 { font-size: 12px; margin: 0 0 10px; color: var(--dim);
+     text-transform: uppercase; letter-spacing: .08em; }
+.pill {
+  margin-left: auto; padding: 3px 10px; border-radius: 999px;
+  font-size: 12px; background: var(--bad); color: #fff;
+}
+.pill.up { background: var(--fan); }
+main {
+  display: grid; gap: 14px; padding: 20px; max-width: 1000px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+.card {
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: 10px; padding: 16px;
+}
+.wide { grid-column: 1 / -1; }
+.state-name { font-size: 40px; font-weight: 700; letter-spacing: -.02em; }
+.state-OFF { color: var(--off); }
+.state-FAN { color: var(--fan); }
+.state-COMPRESSOR { color: var(--compressor); }
+dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 10px 0 0; }
+dt { color: var(--dim); }
+dd { margin: 0; font-variant-numeric: tabular-nums; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+td { padding: 3px 0; }
+td:last-child { text-align: right; }
+td.name { color: var(--dim); }
+form { display: grid; gap: 8px; }
+label { display: grid; grid-template-columns: 1fr 88px; align-items: center; gap: 8px; }
+label span { color: var(--dim); font-size: 13px; }
+input, select {
+  background: #11131a; color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 5px 7px; font: inherit; width: 100%;
+}
+.note { color: var(--dim); font-size: 12px; margin: 10px 0 0; }
+ul { list-style: none; margin: 0; padding: 0; }
+li { padding: 8px 0; border-top: 1px solid var(--line); display: flex;
+     align-items: center; gap: 12px; flex-wrap: wrap; }
+li .when { color: var(--dim); font-variant-numeric: tabular-nums; }
+audio { height: 30px; margin-left: auto; }

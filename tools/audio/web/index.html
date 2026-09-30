@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>INMP441 Live</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>INMP441 detector</h1>
+  <span id="link" class="pill">connecting</span>
+</header>
+
+<main>
+  <section class="card state">
+    <div id="state" class="state-name">--</div>
+    <dl>
+      <dt>candidate</dt><dd id="candidate">--</dd>
+      <dt>stable</dt><dd id="stable">--</dd>
+    </dl>
+  </section>
+
+  <section class="card">
+    <h2>Features</h2>
+    <table id="features"><tbody></tbody></table>
+  </section>
+
+  <section class="card">
+    <h2>Stream</h2>
+    <table id="stream"><tbody></tbody></table>
+  </section>
+
+  <section class="card">
+    <h2>Settings</h2>
+    <form id="settings"></form>
+    <p id="saved" class="note"></p>
+  </section>
+
+  <section class="card wide">
+    <h2>Events</h2>
+    <p class="note">
+      Written on a published state change: 15 s before and after,
+      raw PCM, with the decision that caused it.
+    </p>
+    <ul id="events"></ul>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
