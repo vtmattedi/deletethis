@@ -27,54 +27,61 @@ saying so:
 cp include/creds.example.h include/creds.h     # then fill it in
 ```
 
-Every tool takes either a serial port or a network address, and works
-the same either way:
+### The two transports have separate jobs
 
 ```
-python tools/audio/capture.py COM9 --label off --seconds 30
+TCP     binary audio, and nothing else
+Serial  commands, status and logs, and nothing else
+```
+
+Nothing has to arbitrate who owns Serial, because audio never goes
+there. A log line cannot land in the middle of a PCM frame, so the
+firmware is free to report Wi-Fi changes, client connects and I2S
+overruns whenever they happen.
+
+**Audio comes over TCP.** The ESP32 prints its IP at boot:
+
+```
 python tools/audio/capture.py 192.168.1.50 --label off --seconds 30
 python tools/audio/visualize.py 192.168.1.50:3333 --play
+python tools/audio/classify_live.py 192.168.1.50
 ```
 
-The ESP32 prints its IP at boot. A name with a dot, or anything with
-an explicit `:port`, is treated as a network target; `COM9` and
-`/dev/ttyUSB0` are not. Over TCP the firmware starts streaming as soon
-as the socket is accepted, so there is no handshake to wait for, and
-the default port is 3333.
+A name with a dot, or anything with an explicit `:port`, is a network
+target; `COM9` and `/dev/ttyUSB0` are not. Streaming starts as soon as
+the socket is accepted — there is no handshake and no command to send.
+The default port is 3333, and **one client at a time**: a second
+connection is refused rather than queued.
 
-Only **one TCP client at a time**: a second connection is refused
-rather than queued. While a TCP client is streaming, Serial stays a
-text channel and serial capture is refused, so the 64 kB/s stream is
-never sent twice.
+**Serial is for watching the device.** At 921600 baud:
 
-The serial link runs at **921600 baud**, not 115200. 16 kHz x 4 bytes is 64 kB/s, which
+| Command | Effect |
+| --- | --- |
+| `t` | TEXT mode: periodic RMS / band / peak diagnostics |
+| `s` | IDLE: stop the diagnostics |
+| `?` | status: sample rate, IP, port, client, I2S overruns |
+| `c` | prints `# capture over serial disabled; use TCP` |
+
+Serial also logs Wi-Fi up/down, client connect and disconnect, and
+I2S overruns as they occur.
+
+Streaming audio over serial still exists as a fallback: set
+`ALLOW_SERIAL_CAPTURE` to 1 in `src/main.cpp`, reflash, and the tools
+accept `COM9` again. It is off by default so the invariant above
+holds. 16 kHz x 4 bytes is 64 kB/s, which
 does not fit in 115200 baud. If your USB-serial adapter cannot hold
 921600, lower `SERIAL_BAUD` in `src/main.cpp` and pass the same value
 to `--baud` — but below about 700000 baud the stream will drop frames.
 
-## Firmware modes
-
-The ESP32 starts in TEXT mode and takes single-character commands:
-
-| Command | Mode | Output |
-| --- | --- | --- |
-| `t` | TEXT | human-readable RMS / band / peak diagnostics |
-| `c` | CAPTURE | binary PCM stream, nothing else on the wire |
-| `s` | IDLE | stops both |
-| `?` | — | one status line |
-
-`capture.py` and `visualize.py` send `c` themselves, so you never have
-to do this by hand. TEXT mode is there for a serial monitor.
-
-Only one program can hold the port. Close the PlatformIO serial
-monitor before capturing.
-
 ## Recording
 
 ```
-python tools/audio/capture.py --list-ports
-python tools/audio/capture.py COM13 --label off --seconds 30
+python tools/audio/capture.py 192.168.1.50 --label off --seconds 30
 ```
+
+The serial monitor can stay open while you record, because the two
+transports no longer compete: audio goes over TCP and the monitor only
+carries text.
 
 Writes `recordings/2026-09-30_091500_off.wav`: mono, 16 kHz, 32-bit
 PCM. The 24-bit microphone samples are stored shifted up into the

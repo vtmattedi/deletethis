@@ -68,6 +68,10 @@ static QueueHandle_t i2sEvents = nullptr;
 // captured and then overwritten before it could be sent.
 static uint32_t i2sOverruns = 0;
 
+static uint32_t lastOverrunReport = 0;
+
+static constexpr uint32_t OVERRUN_REPORT_INTERVAL_MS = 1000;
+
 // ============================================================
 // Streaming protocol
 //
@@ -127,10 +131,29 @@ static_assert(
 // Operating mode
 // ============================================================
 
+// ============================================================
+// Transport roles
+//
+//   Serial = commands, status and logs. Always human-readable.
+//   TCP    = binary audio. Always machine-readable.
+//
+// Keeping them separate means nothing has to arbitrate who owns
+// Serial: a log line can never land in the middle of a PCM
+// frame, because PCM never goes there. That invariant is worth
+// more than being able to stream over either pipe.
+//
+// The serial streaming path below is still compiled, as a
+// reference and a fallback if the network is unavailable. Set
+// this to 1 to make the `c` command reach it again; the PC
+// tools will then work over a serial port as well.
+// ============================================================
+
+#define ALLOW_SERIAL_CAPTURE 0
+
 enum class Mode
 {
     TEXT,
-    CAPTURE,
+    CAPTURE,   // unreachable unless ALLOW_SERIAL_CAPTURE
     IDLE
 };
 
@@ -862,6 +885,8 @@ void drainI2sEvents()
 
     i2s_event_t event;
 
+    uint32_t seen = 0;
+
     while (xQueueReceive(i2sEvents, &event, 0) == pdTRUE)
     {
         if (event.type != I2S_EVENT_RX_Q_OVF)
@@ -871,7 +896,30 @@ void drainI2sEvents()
             pendingDropped++;
 
         i2sOverruns++;
+        seen++;
     }
+
+    if (seen == 0)
+        return;
+
+    // Safe to say so on Serial, because Serial never carries
+    // audio. Throttled, since an overrun tends to arrive with
+    // friends and the log is meant to be readable.
+    if (mode == Mode::CAPTURE)
+        return;
+
+    const uint32_t now = millis();
+
+    if (now - lastOverrunReport < OVERRUN_REPORT_INTERVAL_MS)
+        return;
+
+    lastOverrunReport = now;
+
+    Serial.printf(
+        "# i2s: %u overrun(s), %u total -- audio was lost\n",
+        seen,
+        i2sOverruns
+    );
 }
 
 // Reads one frame into i2sSamples, right-aligned and ready to
@@ -1153,7 +1201,30 @@ void handleCommands()
 
             case 'c':
             case 'C':
+#if ALLOW_SERIAL_CAPTURE
                 enterMode(Mode::CAPTURE);
+#else
+                Serial.println();
+                Serial.println(
+                    "# capture over serial disabled; use TCP"
+                );
+
+                if (WiFi.status() == WL_CONNECTED)
+                {
+                    Serial.printf(
+                        "# connect to tcp://%s:%u\n",
+                        WiFi.localIP().toString().c_str(),
+                        static_cast<unsigned>(AUDIO_TCP_PORT)
+                    );
+                }
+                else
+                {
+                    Serial.println(
+                        "# wifi is down, so there is nowhere to "
+                        "connect yet"
+                    );
+                }
+#endif
                 break;
 
             case 's':
@@ -1238,9 +1309,20 @@ void setup()
     setupWifi();
     startAudioServer();
 
+#if ALLOW_SERIAL_CAPTURE
     Serial.println(
         "Commands: t=text  c=capture  s=stop  ?=status"
     );
+#else
+    Serial.println(
+        "Commands: t=text  s=stop  ?=status"
+    );
+
+    Serial.println(
+        "Serial is text only. Audio streams over TCP; "
+        "connect a client to start it."
+    );
+#endif
 
     Serial.println("Starting analysis.");
 }

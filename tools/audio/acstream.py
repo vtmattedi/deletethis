@@ -322,9 +322,15 @@ class AudioStream:
             )
 
         raise ProtocolError(
-            "No stream header received. Check that the firmware in "
-            f"src/main.cpp is flashed and that {self.baud} baud matches "
-            "SERIAL_BAUD."
+            "No stream header received over serial.\n\n"
+            "The firmware streams audio over TCP only: Serial is a "
+            "text channel for commands, status and logs. Read the IP "
+            "it prints at boot and connect to that instead, e.g.\n"
+            "    192.168.1.50        (port 3333 by default)\n\n"
+            "If you meant to use serial, set ALLOW_SERIAL_CAPTURE to 1 "
+            "in src/main.cpp and reflash; then check the port is not "
+            f"held by another program and that {self.baud} baud "
+            "matches SERIAL_BAUD."
         )
 
     def _scan_for(
