@@ -25,6 +25,7 @@ TOOLS = HERE.parent
 
 RESULTS = TOOLS / "results"
 EVENTS_DIR = RESULTS / "events"
+HISTORY_DB = RESULTS / "audio.db"
 RECORDINGS = TOOLS / "recordings"
 WEB = TOOLS / "web"
 
@@ -131,6 +132,7 @@ class AppConfig:
     events: EventConfig = field(default_factory=EventConfig)
 
     events_dir: Path = EVENTS_DIR
+    history_path: Path = HISTORY_DB
 
     def to_api(self) -> dict:
         payload = self.classifier.to_api()

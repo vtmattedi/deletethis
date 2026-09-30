@@ -44,6 +44,92 @@ def to_wav_samples(samples: np.ndarray) -> np.ndarray:
     return (clipped.astype(np.int64) << 8).astype(np.int32)
 
 
+def event_timeline(
+    wav_path: Path,
+    config: ClassifierConfig,
+    pre_seconds: float,
+    nfft: int = 1024,
+    overlap: float = 0.5,
+) -> dict:
+    """Recompute the feature timeline from an event's audio.
+
+    Derived on demand rather than stored, so the JSON stays a decision
+    summary and the WAV stays the only copy of the evidence. It also
+    means an old event can be re-examined under different thresholds
+    without having recorded anything extra.
+
+    Times are relative to the transition: negative is before it.
+
+    The smoother starts cold here, so the published state near the
+    left edge is warming up and will not match what was live at the
+    time -- live had history from before the pre-roll. The candidate
+    and the band levels are exact; only the held state has to catch
+    up.
+    """
+    from scipy.io import wavfile
+
+    from acstream import FULL_SCALE
+    from analyze import to_float
+    from classify_live import (
+        DIAGNOSTIC_BANDS,
+        RULE_BANDS,
+        FeatureExtractor,
+        Smoother,
+    )
+
+    bands = RULE_BANDS + DIAGNOSTIC_BANDS
+
+    sample_rate, raw = wavfile.read(wav_path)
+
+    signal = to_float(raw) * FULL_SCALE
+
+    extractor = FeatureExtractor(sample_rate, nfft, overlap)
+
+    smoother = Smoother(
+        config.thresholds(),
+        window_rate=sample_rate / extractor.hop,
+        median_seconds=config.median_seconds,
+        hold_seconds=config.hold_seconds,
+    )
+
+    columns: dict[str, list] = {
+        "t": [],
+        "state": [],
+        "candidate": [],
+        "rms": [],
+    }
+
+    for name in bands:
+        columns[name] = []
+
+    chunk = 512
+
+    for start in range(0, signal.size - chunk + 1, chunk):
+        for features in extractor.push(signal[start : start + chunk]):
+            decision = smoother.update(features)
+
+            columns["t"].append(
+                round(features.time - pre_seconds, 3)
+            )
+            columns["state"].append(decision.state)
+            columns["candidate"].append(decision.candidate)
+            columns["rms"].append(round(decision.rms_db, 2))
+
+            for name in bands:
+                columns[name].append(
+                    round(decision.smoothed[name], 2)
+                )
+
+    return {
+        "sampleRate": sample_rate,
+        "nfft": nfft,
+        "overlap": overlap,
+        "preSeconds": pre_seconds,
+        "count": len(columns["t"]),
+        "columns": columns,
+    }
+
+
 @dataclass
 class PendingEvent:
     """A capture in progress, still collecting its post-roll."""
@@ -96,6 +182,25 @@ class EventRecorder:
         self.written: list[dict] = []
 
         self.directory.mkdir(parents=True, exist_ok=True)
+
+        self._load_existing()
+
+    def _load_existing(self) -> None:
+        """Index events already on disk.
+
+        The files are the record, not this list, so a restart must not
+        make earlier transitions disappear from the UI.
+        """
+        for path in sorted(self.directory.glob("*.json")):
+            try:
+                metadata = json.loads(
+                    path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                continue
+
+            if isinstance(metadata, dict) and "id" in metadata:
+                self.written.append(metadata)
 
     # ------------------------------------------------------ config
 
@@ -265,6 +370,27 @@ class EventRecorder:
     def recent(self, limit: int = 50) -> list[dict]:
         with self.lock:
             return list(reversed(self.written[-limit:]))
+
+    def get(self, identifier: str) -> dict | None:
+        with self.lock:
+            for metadata in reversed(self.written):
+                if metadata.get("id") == identifier:
+                    return metadata
+
+        return None
+
+    def wav_path(self, identifier: str) -> Path | None:
+        """Resolve an id to a file, refusing anything outside the dir.
+
+        The id arrives from a URL, so it must not be able to name a
+        path of its own.
+        """
+        path = (self.directory / f"{identifier}.wav").resolve()
+
+        if self.directory.resolve() not in path.parents:
+            return None
+
+        return path if path.is_file() else None
 
     def status(self) -> dict:
         with self.lock:

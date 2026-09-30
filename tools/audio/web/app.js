@@ -1,6 +1,8 @@
 // Display and configure. No DSP, no classification: every number
 // here was decided by the backend.
 
+import { lineChart, legend } from "./charts.js";
+
 const FEATURES = ["rms", "30-80", "500-1k", "1k-2k", "200-1200"];
 
 const STREAM_FIELDS = [
@@ -178,6 +180,11 @@ async function loadEvents() {
 
   for (const event of events) {
     const item = document.createElement("li");
+    item.className = "event";
+    item.addEventListener("click", (e) => {
+      if (e.target.tagName === "AUDIO") return;   // let controls work
+      openEvent(event.id, item);
+    });
 
     const when = document.createElement("span");
     when.className = "when";
@@ -217,3 +224,183 @@ function connect() {
 
 connect();
 loadEvents();
+
+
+// ------------------------------------------------------------ history
+
+const BANDS = ["30-80", "500-1k", "1k-2k"];
+
+async function loadHistory() {
+  const seconds = Number($("range").value);
+
+  const response = await fetch(`/api/history?seconds=${seconds}`);
+  if (!response.ok) return;
+
+  const data = await response.json();
+  const c = data.columns;
+
+  const note = $("historyNote");
+  note.textContent = data.count
+    ? `${data.count} point${data.count === 1 ? "" : "s"}` +
+      (data.truncated ? " (truncated)" : "")
+    : "nothing recorded in this range yet";
+
+  const column = { "30-80": "band_30_80", "500-1k": "band_500_1k",
+                   "1k-2k": "band_1k_2k" };
+
+  legend($("historyLegend"), ["rms", ...BANDS]);
+
+  lineChart(
+    $("historyChart"),
+    c.t || [],
+    [
+      { name: "rms", values: c.rms || [] },
+      ...BANDS.map((b) => ({ name: b, values: c[column[b]] || [] })),
+    ],
+    {
+      height: 200,
+      states: c.state || [],
+      xFormat: (v) => new Date(v * 1000).toLocaleTimeString(),
+      emptyText: "no history recorded in this range yet",
+    },
+  );
+}
+
+$("range").addEventListener("change", loadHistory);
+
+// ------------------------------------------------------- event detail
+
+function table(pairs) {
+  const t = document.createElement("table");
+  t.className = "kv";
+  for (const [k, v] of pairs) {
+    const row = t.insertRow();
+    row.insertCell().textContent = k;
+    row.insertCell().textContent = v;
+  }
+  return t;
+}
+
+function heading(text) {
+  const h = document.createElement("h3");
+  h.textContent = text;
+  return h;
+}
+
+async function openEvent(id, item) {
+  for (const other of document.querySelectorAll("li.event.open")) {
+    other.classList.remove("open");
+  }
+  if (item) item.classList.add("open");
+
+  const panel = $("detail");
+  const body = $("detailBody");
+  panel.hidden = false;
+  body.textContent = "loading…";
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+
+  const meta = await (await fetch(`/api/events/${id}`)).json();
+
+  body.textContent = "";
+
+  const title = document.createElement("div");
+  title.className = "state-name";
+  title.style.fontSize = "24px";
+  title.textContent = `${meta.from || "--"} → ${meta.to}`;
+  title.classList.add("state-" + meta.to);
+  body.append(title);
+
+  const grid = document.createElement("div");
+  grid.className = "grid2";
+
+  const left = document.createElement("div");
+  left.append(heading("transition"), table([
+    ["time", meta.time.replace("T", " ")],
+    ["candidate held", meta.candidateHeldSeconds + " s"],
+    ["audio", `${meta.audio.seconds} s ` +
+      `(${meta.audio.preSeconds} before / ${meta.audio.postSeconds} after)`],
+  ]));
+
+  left.append(heading("features at transition"), table(
+    Object.entries(meta.featuresAtTransition).map(
+      ([k, v]) => [k, v + " dB"]),
+  ));
+
+  const right = document.createElement("div");
+  right.append(heading("classifier config at the time"), table(
+    Object.entries(meta.classifierConfig).map(([k, v]) => [k, v]),
+  ));
+
+  const stats = document.createElement("table");
+  stats.className = "kv";
+  const head = stats.createTHead().insertRow();
+  for (const label of ["band", "median", "min", "max", "std"]) {
+    const th = document.createElement("th");
+    th.textContent = label;
+    head.append(th);
+  }
+  for (const [band, s] of Object.entries(meta.decisionWindow || {})) {
+    const row = stats.insertRow();
+    row.insertCell().textContent = band;
+    for (const key of ["median", "min", "max", "std"]) {
+      row.insertCell().textContent = s[key];
+    }
+  }
+  right.append(heading("decision window"), stats);
+
+  grid.append(left, right);
+  body.append(grid);
+
+  const audio = document.createElement("audio");
+  audio.controls = true;
+  audio.src = `/api/events/${id}/audio`;
+  audio.style.width = "100%";
+  audio.style.marginTop = "14px";
+  body.append(audio);
+
+  body.append(heading("feature timeline, recomputed from the audio"));
+
+  const chartLegend = document.createElement("div");
+  chartLegend.className = "legend";
+  const chart = document.createElement("div");
+  chart.className = "chart";
+  const note = document.createElement("p");
+  note.className = "note";
+  body.append(chartLegend, chart, note);
+
+  note.textContent = "computing…";
+
+  const timeline = await (
+    await fetch(`/api/events/${id}/timeline`)
+  ).json();
+
+  const c = timeline.columns;
+  legend(chartLegend, ["rms", ...BANDS]);
+
+  lineChart(chart, c.t, [
+    { name: "rms", values: c.rms },
+    ...BANDS.map((b) => ({ name: b, values: c[b] })),
+  ], {
+    height: 220,
+    states: c.state,
+    zeroLine: true,
+    xFormat: (v) => v.toFixed(0) + "s",
+  });
+
+  note.textContent =
+    `${timeline.count} windows, recomputed from the WAV with the ` +
+    `settings recorded in the event. The strip is the published ` +
+    `state; near the left edge it is still warming up, because this ` +
+    `replay starts cold while the live classifier had history from ` +
+    `before the pre-roll.`;
+}
+
+$("closeDetail").addEventListener("click", () => {
+  $("detail").hidden = true;
+  for (const other of document.querySelectorAll("li.event.open")) {
+    other.classList.remove("open");
+  }
+});
+
+loadHistory();
+setInterval(loadHistory, 15000);

@@ -22,6 +22,7 @@ from acstream import AudioStream, ProtocolError
 from .classifier import ClassifierService
 from .config import AppConfig
 from .events import EventRecorder
+from .history import HistoryStore
 
 RECONNECT_DELAY_SECONDS = 2.0
 
@@ -74,6 +75,11 @@ class StreamService(threading.Thread):
         # its sample rate rather than us assuming one.
         self.classifier: ClassifierService | None = None
         self.events: EventRecorder | None = None
+
+        # Opened eagerly: history should survive the ESP32 being
+        # unreachable, and the UI can then say so rather than showing
+        # an empty database.
+        self.history = HistoryStore(config.history_path)
 
         self.ready = threading.Event()
 
@@ -135,6 +141,12 @@ class StreamService(threading.Thread):
         assert self.events is not None
 
         produced = self.classifier.push(samples)
+
+        # One row a second, rate-limited inside the store.
+        with self.lock:
+            health = self.health
+
+        self.history.maybe_record(self.classifier.current(), health)
 
         # Raw PCM, exactly as received, before anything touches it.
         written = self.events.push(samples)
@@ -279,7 +291,12 @@ class StreamService(threading.Thread):
         if self.events is not None:
             payload["events"] = self.events.status()
 
+        payload["history"] = self.history.status()
+
         return payload
 
     def stop(self) -> None:
         self.stop_event.set()
+
+    def close(self) -> None:
+        self.history.close()

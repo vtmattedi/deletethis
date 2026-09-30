@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import contextlib
 import sys
+import time
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -19,15 +20,27 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
     from backend import config as config_module
+    from backend.config import ClassifierConfig
+    from backend.events import event_timeline
+    from backend.history import to_epoch
     from backend.models import ConfigPatch
     from backend.stream import StreamService
 else:
     from . import config as config_module
+    from .config import ClassifierConfig
+    from .events import event_timeline
+    from .history import to_epoch
     from .models import ConfigPatch
     from .stream import StreamService
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -47,6 +60,7 @@ def create_app(settings: AppConfig) -> FastAPI:
 
         service.stop()
         service.join(timeout=3.0)
+        service.close()
 
     app = FastAPI(title="INMP441 audio backend", lifespan=lifespan)
 
@@ -99,19 +113,90 @@ def create_app(settings: AppConfig) -> FastAPI:
 
         return {"events": service.events.recent()}
 
+    @app.get("/api/events/{identifier}")
+    async def get_event(identifier: str) -> dict:
+        metadata = (
+            service.events.get(identifier)
+            if service.events is not None
+            else None
+        )
+
+        if metadata is None:
+            raise HTTPException(status_code=404, detail="no such event")
+
+        return metadata
+
     @app.get("/api/events/{identifier}/audio")
     async def get_event_audio(identifier: str) -> FileResponse:
-        # The identifier becomes a path, so it must not be able to
-        # leave the events directory.
-        path = (settings.events_dir / f"{identifier}.wav").resolve()
+        path = (
+            service.events.wav_path(identifier)
+            if service.events is not None
+            else None
+        )
 
-        if (
-            settings.events_dir.resolve() not in path.parents
-            or not path.is_file()
-        ):
+        if path is None:
             raise HTTPException(status_code=404, detail="no such event")
 
         return FileResponse(path, media_type="audio/wav")
+
+    @app.get("/api/events/{identifier}/timeline")
+    def get_event_timeline(identifier: str) -> dict:
+        # Sync, so Starlette runs it off the event loop: this reads a
+        # WAV and runs an FFT over every window in it.
+        if service.events is None:
+            raise HTTPException(status_code=404, detail="no such event")
+
+        metadata = service.events.get(identifier)
+        path = service.events.wav_path(identifier)
+
+        if metadata is None or path is None:
+            raise HTTPException(status_code=404, detail="no such event")
+
+        # Rebuilt with the settings that were live when it was
+        # recorded, so the picture matches the decision that was made.
+        recorded = ClassifierConfig().patched(
+            metadata.get("classifierConfig", {})
+        )
+
+        timeline = event_timeline(
+            path,
+            recorded,
+            pre_seconds=metadata.get("audio", {}).get(
+                "preSeconds", 0.0
+            ),
+        )
+
+        timeline["id"] = identifier
+        timeline["classifierConfig"] = recorded.to_api()
+
+        return timeline
+
+    # ----------------------------------------------------- history
+
+    @app.get("/api/history")
+    def get_history(
+        request: Request,
+        seconds: float = 900.0,
+        limit: int = 20000,
+    ) -> dict:
+        """Compact state history. `from`/`to` accept epoch or ISO.
+
+        Declared as query params by hand because `from` is a Python
+        keyword and cannot be a parameter name.
+        """
+        now = time.time()
+
+        params = request.query_params
+
+        end = to_epoch(params.get("to"), now)
+        start = to_epoch(
+            params.get("from"), end - max(seconds, 1.0)
+        )
+
+        if start > end:
+            start, end = end, start
+
+        return service.history.query(start, end, limit)
 
     # -------------------------------------------------------- live
 

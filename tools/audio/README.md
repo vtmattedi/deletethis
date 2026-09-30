@@ -281,7 +281,10 @@ never classifies and never talks to the ESP32.
 | `GET /api/config` | current thresholds and timings |
 | `PATCH /api/config` | change them live |
 | `GET /api/events` | recorded transitions, newest first |
+| `GET /api/events/{id}` | one event's full metadata |
 | `GET /api/events/{id}/audio` | that event's WAV |
+| `GET /api/events/{id}/timeline` | feature timeline recomputed from the WAV |
+| `GET /api/history` | compact state history |
 | `WS /ws/live` | snapshots, 5 Hz by default |
 
 The classifier runs at the full window rate (~31/s); only the UI
@@ -317,11 +320,46 @@ defaults (15 s pre-roll against a 2.5 s decision) there is plenty of
 genuine "before"; raising `holdSeconds` towards `eventPreSeconds` eats
 into it.
 
+### History
+
+One row per second in SQLite at `results/audio.db`: state, candidate,
+hold, RMS, the four bands, and stream health. About 86k rows a day,
+which SQLite does not notice. The ~31 classifier windows per second
+are deliberately *not* stored — they only matter around a transition,
+and that is what the event WAVs are for.
+
+```
+GET /api/history?seconds=900
+GET /api/history?from=2026-09-30T13:00:00&to=2026-09-30T14:00:00
+```
+
+`from` and `to` accept a unix timestamp or an ISO-8601 string. The
+response is columnar, because the only consumer is a chart. The UI
+plots RMS and the three rule bands with a state strip underneath.
+
+### Event timeline
+
+`GET /api/events/{id}/timeline` recomputes the feature timeline from
+the event's WAV, using the classifier config recorded with it. Times
+are relative to the transition, so negative is before it.
+
+Deriving it on demand keeps the storage honest: the WAV stays the only
+copy of the evidence and the JSON stays a decision summary, with no
+third place for the two to disagree. It also means an old event can be
+re-examined under different thresholds without having recorded
+anything extra.
+
+One caveat the UI states on the chart: the replay starts cold, so the
+published state near the left edge is still warming up and will not
+match what was live at the time — live had history from before the
+pre-roll. The band levels and the candidate are exact; only the held
+state lags.
+
 ### Not built yet
 
-SQLite history, the replay API and the events/history/replay browser
-pages are later phases. `classify_live.py --replay` covers replay from
-the command line in the meantime.
+The replay API, `/ws/audio` browser listening, and the replay UI are
+later phases. `classify_live.py --replay` covers replay from the
+command line in the meantime.
 
 ## Deciding what goes back into the firmware
 

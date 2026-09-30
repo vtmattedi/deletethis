@@ -38,6 +38,22 @@
   </section>
 
   <section class="card wide">
+    <div class="head">
+      <h2>History</h2>
+      <select id="range">
+        <option value="300">last 5 min</option>
+        <option value="900" selected>last 15 min</option>
+        <option value="3600">last hour</option>
+        <option value="21600">last 6 hours</option>
+        <option value="86400">last day</option>
+      </select>
+      <span id="historyNote" class="note"></span>
+    </div>
+    <div id="historyLegend" class="legend"></div>
+    <div id="historyChart" class="chart"></div>
+  </section>
+
+  <section class="card wide">
     <h2>Events</h2>
     <p class="note">
       Written on a published state change: 15 s before and after,
@@ -45,8 +61,16 @@
     </p>
     <ul id="events"></ul>
   </section>
+
+  <section class="card wide" id="detail" hidden>
+    <div class="head">
+      <h2>Event detail</h2>
+      <button id="closeDetail" type="button">close</button>
+    </div>
+    <div id="detailBody"></div>
+  </section>
 </main>
 
-<script src="app.js"></script>
+<script type="module" src="app.js"></script>
 </body>
 </html>
