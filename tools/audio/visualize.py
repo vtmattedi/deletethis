@@ -423,7 +423,7 @@ class Player:
         sample_rate: int,
         device: str | int | None = None,
         gain_db: float = 0.0,
-        buffer_seconds: float = 0.4,
+        buffer_seconds: float = 2.4,
     ) -> None:
         self.sample_rate = sample_rate
         self.device = device

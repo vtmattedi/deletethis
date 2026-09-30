@@ -29,6 +29,9 @@ shifted down out of the 32-bit I2S slot, so full scale is 2**23.
 
 from __future__ import annotations
 
+import re
+import select
+import socket
 import struct
 import time
 from dataclasses import dataclass
@@ -37,6 +40,95 @@ import numpy as np
 import serial
 
 DEFAULT_BAUD = 921600
+
+# The firmware's TCP audio server. Same protocol, different pipe.
+DEFAULT_TCP_PORT = 3333
+
+# "192.168.1.50", "esp32.local:3333" -- anything with a dot or an
+# explicit port. Serial names (COM9, /dev/ttyUSB0) have neither.
+NETWORK_TARGET = re.compile(r"^[^\s:]+\.[^\s:]+(:\d+)?$|^[^\s:]+:\d+$")
+
+
+def is_network_target(target: str) -> bool:
+    return bool(NETWORK_TARGET.match(target))
+
+
+def split_target(target: str) -> tuple[str, int]:
+    """'host', 'host:port' -> (host, port)."""
+    if ":" in target:
+        host, _, port = target.rpartition(":")
+        return host, int(port)
+
+    return target, DEFAULT_TCP_PORT
+
+
+class _SocketTransport:
+    """A socket wearing just enough of pyserial's surface.
+
+    AudioStream only needs read/write/flush/in_waiting/close, so
+    adapting here keeps every byte of the framing and resync logic
+    shared between the two transports rather than forked.
+    """
+
+    def __init__(self, host: str, port: int, timeout: float) -> None:
+        self.socket = socket.create_connection(
+            (host, port), timeout=timeout
+        )
+
+        # Small frames, latency matters more than packing.
+        self.socket.setsockopt(
+            socket.IPPROTO_TCP, socket.TCP_NODELAY, 1
+        )
+
+        self.socket.settimeout(timeout)
+        self.is_open = True
+
+    def read(self, size: int = 1) -> bytes:
+        if size <= 0 or not self.is_open:
+            return b""
+
+        try:
+            return self.socket.recv(size)
+        except socket.timeout:
+            return b""
+        except OSError:
+            return b""
+
+    def write(self, data: bytes) -> int:
+        # The firmware streams on connect and never reads the
+        # socket, so commands have nowhere to go. Swallowing them
+        # keeps AudioStream's handshake identical for both pipes.
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    @property
+    def in_waiting(self) -> int:
+        if not self.is_open:
+            return 0
+
+        try:
+            readable, _, _ = select.select([self.socket], [], [], 0)
+        except OSError:
+            return 0
+
+        # select cannot say how much, only that there is some. A
+        # generous number simply caps one recv().
+        return 65536 if readable else 0
+
+    def reset_input_buffer(self) -> None:
+        while self.in_waiting:
+            if not self.read(65536):
+                return
+
+    def close(self) -> None:
+        self.is_open = False
+
+        try:
+            self.socket.close()
+        except OSError:
+            pass
 
 STREAM_MAGIC = b"ACD1"
 FRAME_MAGIC = b"ACDF"
@@ -141,21 +233,34 @@ class AudioStream:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
+    @property
+    def is_network(self) -> bool:
+        return is_network_target(self.port)
+
     def open(self) -> None:
-        self._log(f"Opening {self.port} at {self.baud} baud...")
+        if self.is_network:
+            host, tcp_port = split_target(self.port)
 
-        self.serial = serial.Serial(
-            self.port,
-            self.baud,
-            timeout=self.timeout,
-        )
+            self._log(f"Connecting to {host}:{tcp_port}...")
 
-        # Opening the port toggles DTR/RTS on most USB-serial
-        # adapters, which resets the ESP32. Wait for its banner
-        # to finish rather than talking over the bootloader.
-        time.sleep(self.boot_wait)
+            self.serial = _SocketTransport(
+                host, tcp_port, self.timeout
+            )
+        else:
+            self._log(f"Opening {self.port} at {self.baud} baud...")
 
-        self._discard_input()
+            self.serial = serial.Serial(
+                self.port,
+                self.baud,
+                timeout=self.timeout,
+            )
+
+            # Opening the port toggles DTR/RTS on most USB-serial
+            # adapters, which resets the ESP32. Wait for its banner
+            # to finish rather than talking over the bootloader.
+            time.sleep(self.boot_wait)
+
+            self._discard_input()
 
         self.info = self._start_capture()
 
@@ -186,12 +291,19 @@ class AudioStream:
         attempt = 0
 
         while time.monotonic() < deadline:
-            # 's' first, in case a previous run left it streaming.
-            self.serial.write(b"sc")
-            self.serial.flush()
+            if self.is_network:
+                # The firmware sends ACD1 the moment the socket is
+                # accepted, so there is nothing to ask for.
+                self._log("Waiting for the stream header...")
+            else:
+                # 's' first, in case a previous run left it streaming.
+                self.serial.write(b"sc")
+                self.serial.flush()
 
-            attempt += 1
-            self._log(f"Requesting CAPTURE mode (attempt {attempt})...")
+                attempt += 1
+                self._log(
+                    f"Requesting CAPTURE mode (attempt {attempt})..."
+                )
 
             # Anything before the magic is the boot banner or leftover
             # TEXT mode output, so it is simply skipped.
@@ -201,6 +313,13 @@ class AudioStream:
 
             if raw is not None:
                 return self._parse_stream_header(raw)
+
+        if self.is_network:
+            raise ProtocolError(
+                "Connected, but no stream header arrived. Another "
+                "client may already hold the socket: the firmware "
+                "serves one at a time."
+            )
 
         raise ProtocolError(
             "No stream header received. Check that the firmware in "

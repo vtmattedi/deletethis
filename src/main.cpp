@@ -1,7 +1,18 @@
 #include <Arduino.h>
 #include <driver/i2s.h>
 #include <arduinoFFT.h>
+#include <WiFi.h>
 #include <math.h>
+
+#if __has_include("creds.h")
+#include "creds.h"
+#else
+#error "Copy include/creds.example.h to include/creds.h and fill in WIFI_SSID / WIFI_PASSWORD."
+#endif
+
+#ifndef AUDIO_TCP_PORT
+#define AUDIO_TCP_PORT 3333
+#endif
 
 // ============================================================
 // ESP32 DevKit V1 + INMP441
@@ -47,6 +58,15 @@ static constexpr double FULL_SCALE_24BIT = 8388608.0;
 
 // Ignore the first few captures after I2S startup.
 static constexpr uint8_t STARTUP_FRAMES_TO_IGNORE = 5;
+
+// I2S driver event queue, used to see DMA overruns.
+static constexpr int I2S_EVENT_QUEUE_LENGTH = 8;
+
+static QueueHandle_t i2sEvents = nullptr;
+
+// Total DMA overruns since boot. Each one is audio that was
+// captured and then overwritten before it could be sent.
+static uint32_t i2sOverruns = 0;
 
 // ============================================================
 // Streaming protocol
@@ -115,6 +135,128 @@ enum class Mode
 };
 
 static Mode mode = Mode::TEXT;
+
+// ============================================================
+// Network
+//
+// One listening socket, one client, no discovery and no
+// application-level reconnect: the client connects, gets a
+// stream header and then frames, and if the write fails the
+// socket is closed and we listen again.
+//
+// A TCP client takes over binary streaming from Serial, so the
+// 64 kB/s stream is never duplicated. Serial stays a text
+// channel while that is happening.
+// ============================================================
+
+static WiFiServer audioServer(AUDIO_TCP_PORT);
+static WiFiClient audioClient;
+
+static bool serverStarted = false;
+static bool wasConnected = false;
+
+// How long a write may make no progress before the client is
+// treated as dead. Dropping audio beats stalling I2S forever.
+static constexpr uint32_t TCP_WRITE_TIMEOUT_MS = 1000;
+
+// How long to wait for the access point at boot.
+static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
+
+// ============================================================
+// Stream sink
+//
+// The frame emission below does not care whether it is writing
+// to Serial or a socket. Both HardwareSerial and WiFiClient
+// derive from Print, so this stays a tag and a pointer rather
+// than a class hierarchy.
+// ============================================================
+
+struct StreamSink
+{
+    Print *out = nullptr;
+
+    // Null for Serial. Set for TCP, where a write can fail
+    // part-way and the peer can vanish.
+    WiFiClient *client = nullptr;
+};
+
+StreamSink serialSink()
+{
+    StreamSink sink;
+    sink.out = &Serial;
+
+    return sink;
+}
+
+StreamSink clientSink(WiFiClient &client)
+{
+    StreamSink sink;
+    sink.out = &client;
+    sink.client = &client;
+
+    return sink;
+}
+
+bool sinkConnected(const StreamSink &sink)
+{
+    if (sink.out == nullptr)
+        return false;
+
+    if (sink.client == nullptr)
+        return true;
+
+    return sink.client->connected();
+}
+
+// Writes everything or reports failure. One call to write() is
+// never assumed to have sent the whole buffer: over TCP a short
+// write is normal, and silently dropping the remainder would
+// corrupt the stream in a way the PC could only see as a lost
+// frame much later.
+bool writeAll(
+    StreamSink &sink,
+    const void *data,
+    size_t size
+)
+{
+    const uint8_t *bytes =
+        static_cast<const uint8_t *>(data);
+
+    uint32_t lastProgress = millis();
+
+    while (size > 0)
+    {
+        if (!sinkConnected(sink))
+            return false;
+
+        const size_t written =
+            sink.out->write(bytes, size);
+
+        if (written > 0)
+        {
+            bytes += written;
+            size -= written;
+
+            lastProgress = millis();
+
+            continue;
+        }
+
+        // No progress. A peer that has stopped reading must not
+        // be allowed to block acquisition indefinitely.
+        if (
+            millis() - lastProgress >
+            TCP_WRITE_TIMEOUT_MS
+        )
+        {
+            return false;
+        }
+
+        delay(1);
+    }
+
+    return true;
+}
 
 // ============================================================
 // Buffers
@@ -259,11 +401,16 @@ void initI2S()
     config.tx_desc_auto_clear = false;
     config.fixed_mclk = 0;
 
+    // With portMAX_DELAY an i2s_read() never returns short, so a
+    // stalled writer does not show up as a failed read: the DMA ring
+    // silently overwrites itself and the audio is gone. The event
+    // queue is the only place that loss is visible, and over TCP it
+    // is the loss that matters.
     esp_err_t err = i2s_driver_install(
         I2S_PORT,
         &config,
-        0,
-        nullptr
+        I2S_EVENT_QUEUE_LENGTH,
+        &i2sEvents
     );
 
     if (err != ESP_OK)
@@ -645,7 +792,7 @@ void processAudio()
 static uint32_t frameSequence = 0;
 static uint16_t pendingDropped = 0;
 
-void sendStreamHeader()
+bool sendStreamHeader(StreamSink &sink)
 {
     StreamHeader header = {};
 
@@ -662,18 +809,78 @@ void sendStreamHeader()
     header.bitsValid = BITS_VALID;
     header.frameSamples = FRAME_SAMPLES;
 
-    Serial.write(
-        reinterpret_cast<const uint8_t *>(&header),
-        sizeof(header)
-    );
+    if (!writeAll(sink, &header, sizeof(header)))
+        return false;
 
-    Serial.flush();
+    if (sink.client == nullptr)
+        Serial.flush();
+
+    return true;
 }
 
-// Streams one frame. A frame that could not be read whole is
-// counted and reported in the next good frame header.
-bool streamFrame()
+bool sendFrame(
+    StreamSink &sink,
+    const int32_t *samples,
+    uint16_t count
+)
 {
+    FrameHeader header = {};
+
+    header.magic[0] = 'A';
+    header.magic[1] = 'C';
+    header.magic[2] = 'D';
+    header.magic[3] = 'F';
+
+    header.sequence = frameSequence++;
+    header.samples = count;
+    header.dropped = pendingDropped;
+
+    pendingDropped = 0;
+
+    if (!writeAll(sink, &header, sizeof(header)))
+        return false;
+
+    return writeAll(
+        sink,
+        samples,
+        static_cast<size_t>(count) * sizeof(int32_t)
+    );
+}
+
+// Counts DMA overruns into pendingDropped, so the PC sees them
+// in the next frame header exactly as it sees a short read.
+//
+// This is the measurement to watch when streaming over WiFi: if
+// a write stalls for longer than the DMA ring holds -- 8 buffers
+// of 256 samples, about 128 ms -- audio is lost, and without
+// this the sequence numbers would still be contiguous and the
+// gap would be invisible.
+void drainI2sEvents()
+{
+    if (i2sEvents == nullptr)
+        return;
+
+    i2s_event_t event;
+
+    while (xQueueReceive(i2sEvents, &event, 0) == pdTRUE)
+    {
+        if (event.type != I2S_EVENT_RX_Q_OVF)
+            continue;
+
+        if (pendingDropped < 0xFFFF)
+            pendingDropped++;
+
+        i2sOverruns++;
+    }
+}
+
+// Reads one frame into i2sSamples, right-aligned and ready to
+// send. A frame that could not be read whole is counted and
+// reported in the next good frame header.
+bool readPcmFrame()
+{
+    drainI2sEvents();
+
     const size_t sampleCount =
         readSamples(FRAME_SAMPLES);
 
@@ -690,30 +897,154 @@ bool streamFrame()
     for (uint16_t i = 0; i < FRAME_SAMPLES; i++)
         i2sSamples[i] = i2sSamples[i] >> 8;
 
-    FrameHeader header = {};
+    return true;
+}
 
-    header.magic[0] = 'A';
-    header.magic[1] = 'C';
-    header.magic[2] = 'D';
-    header.magic[3] = 'F';
+// ============================================================
+// WiFi and the audio server
+// ============================================================
 
-    header.sequence = frameSequence++;
-    header.samples = FRAME_SAMPLES;
-    header.dropped = pendingDropped;
+void setupWifi()
+{
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);          // latency over power here
+    WiFi.setAutoReconnect(true);
 
+    Serial.printf("WiFi: connecting to \"%s\"", WIFI_SSID);
+
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    const uint32_t started = millis();
+
+    while (
+        WiFi.status() != WL_CONNECTED &&
+        millis() - started < WIFI_CONNECT_TIMEOUT_MS
+    )
+    {
+        delay(250);
+        Serial.print(".");
+    }
+
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        Serial.print("WiFi: connected, IP ");
+        Serial.println(WiFi.localIP());
+        Serial.printf(
+            "Audio server: tcp://%s:%u\n",
+            WiFi.localIP().toString().c_str(),
+            static_cast<unsigned>(AUDIO_TCP_PORT)
+        );
+    }
+    else
+    {
+        // Not fatal. The Serial path still works, and the
+        // station keeps retrying in the background.
+        Serial.println(
+            "WiFi: not connected. Serial capture still works; "
+            "the server starts if the link comes up later."
+        );
+    }
+}
+
+void startAudioServer()
+{
+    if (serverStarted)
+        return;
+
+    audioServer.begin();
+    audioServer.setNoDelay(true);
+
+    serverStarted = true;
+}
+
+void dropClient(const char *reason)
+{
+    if (!audioClient)
+        return;
+
+    audioClient.stop();
+
+    Serial.printf("# tcp: client gone (%s)\n", reason);
+}
+
+// Accepts a client, starts the server once the link is up, and
+// notices a peer that has disappeared.
+void handleTcpClient()
+{
+    const bool connected =
+        WiFi.status() == WL_CONNECTED;
+
+    if (connected != wasConnected)
+    {
+        wasConnected = connected;
+
+        if (connected)
+        {
+            Serial.print("# wifi: up, IP ");
+            Serial.println(WiFi.localIP());
+        }
+        else
+        {
+            Serial.println("# wifi: down");
+
+            dropClient("wifi down");
+        }
+    }
+
+    if (!connected)
+        return;
+
+    startAudioServer();
+
+    if (audioClient && !audioClient.connected())
+        dropClient("disconnected");
+
+    if (audioClient)
+    {
+        // One client for v1. Anyone else is turned away at once
+        // rather than left hanging in the backlog.
+        WiFiClient extra = audioServer.accept();
+
+        if (extra)
+        {
+            extra.println("busy");
+            extra.stop();
+        }
+
+        return;
+    }
+
+    WiFiClient incoming = audioServer.accept();
+
+    if (!incoming)
+        return;
+
+    audioClient = incoming;
+    audioClient.setNoDelay(true);
+
+    Serial.print("# tcp: client ");
+    Serial.print(audioClient.remoteIP());
+    Serial.println(" connected, streaming");
+
+    // A new connection is a new stream session, so the sequence
+    // restarts and the fresh ACD1 header says so.
+    frameSequence = 0;
     pendingDropped = 0;
 
-    Serial.write(
-        reinterpret_cast<const uint8_t *>(&header),
-        sizeof(header)
-    );
+    i2s_zero_dma_buffer(I2S_PORT);
 
-    Serial.write(
-        reinterpret_cast<const uint8_t *>(i2sSamples),
-        FRAME_SAMPLES * sizeof(int32_t)
-    );
+    StreamSink sink = clientSink(audioClient);
 
-    return true;
+    if (!sendStreamHeader(sink))
+        dropClient("header write failed");
+}
+
+bool tcpClientStreaming()
+{
+    return audioClient && audioClient.connected();
 }
 
 // ============================================================
@@ -749,12 +1080,30 @@ void enterMode(Mode next)
             break;
 
         case Mode::CAPTURE:
+            if (tcpClientStreaming())
+            {
+                // Only one binary destination at a time, so the
+                // 64 kB/s stream is never sent twice.
+                mode = Mode::TEXT;
+
+                Serial.println();
+                Serial.println(
+                    "# a TCP client is streaming; "
+                    "disconnect it first"
+                );
+
+                break;
+            }
+
             frameSequence = 0;
             pendingDropped = 0;
 
             i2s_zero_dma_buffer(I2S_PORT);
 
-            sendStreamHeader();
+            {
+                StreamSink sink = serialSink();
+                sendStreamHeader(sink);
+            }
             break;
 
         case Mode::IDLE:
@@ -773,6 +1122,20 @@ void printStatus()
         FRAME_SAMPLES,
         SERIAL_BAUD
     );
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        Serial.printf(
+            "# wifi=up ip=%s port=%u client=%s\n",
+            WiFi.localIP().toString().c_str(),
+            static_cast<unsigned>(AUDIO_TCP_PORT),
+            tcpClientStreaming() ? "yes" : "no"
+        );
+    }
+    else
+    {
+        Serial.println("# wifi=down");
+    }
 }
 
 void handleCommands()
@@ -872,6 +1235,9 @@ void setup()
         captureAudio();
     }
 
+    setupWifi();
+    startAudioServer();
+
     Serial.println(
         "Commands: t=text  c=capture  s=stop  ?=status"
     );
@@ -882,6 +1248,25 @@ void setup()
 void loop()
 {
     handleCommands();
+    handleTcpClient();
+
+    // A TCP client outranks everything: it gets the PCM, and
+    // Serial stays a text channel. The periodic FFT dump is
+    // paused while that happens, because it needs 1024-sample
+    // reads and would fight the 512-sample frame cadence for
+    // the same I2S buffer.
+    if (tcpClientStreaming())
+    {
+        if (!readPcmFrame())
+            return;
+
+        StreamSink sink = clientSink(audioClient);
+
+        if (!sendFrame(sink, i2sSamples, FRAME_SAMPLES))
+            dropClient("write failed");
+
+        return;
+    }
 
     switch (mode)
     {
@@ -891,7 +1276,11 @@ void loop()
             break;
 
         case Mode::CAPTURE:
-            streamFrame();
+            if (readPcmFrame())
+            {
+                StreamSink sink = serialSink();
+                sendFrame(sink, i2sSamples, FRAME_SAMPLES);
+            }
             break;
 
         case Mode::IDLE:

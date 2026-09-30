@@ -19,8 +19,35 @@ pip install -r tools/audio/requirements.txt
 works without it, and the viewer says so instead of failing if PortAudio
 is missing.
 
-The firmware must be the one in `src/main.cpp`, and the serial link
-runs at **921600 baud**, not 115200. 16 kHz x 4 bytes is 64 kB/s, which
+The firmware must be the one in `src/main.cpp`. Copy the credentials
+template before the first build, or the compile stops with a message
+saying so:
+
+```
+cp include/creds.example.h include/creds.h     # then fill it in
+```
+
+Every tool takes either a serial port or a network address, and works
+the same either way:
+
+```
+python tools/audio/capture.py COM9 --label off --seconds 30
+python tools/audio/capture.py 192.168.1.50 --label off --seconds 30
+python tools/audio/visualize.py 192.168.1.50:3333 --play
+```
+
+The ESP32 prints its IP at boot. A name with a dot, or anything with
+an explicit `:port`, is treated as a network target; `COM9` and
+`/dev/ttyUSB0` are not. Over TCP the firmware starts streaming as soon
+as the socket is accepted, so there is no handshake to wait for, and
+the default port is 3333.
+
+Only **one TCP client at a time**: a second connection is refused
+rather than queued. While a TCP client is streaming, Serial stays a
+text channel and serial capture is refused, so the 64 kB/s stream is
+never sent twice.
+
+The serial link runs at **921600 baud**, not 115200. 16 kHz x 4 bytes is 64 kB/s, which
 does not fit in 115200 baud. If your USB-serial adapter cannot hold
 921600, lower `SERIAL_BAUD` in `src/main.cpp` and pass the same value
 to `--baud` — but below about 700000 baud the stream will drop frames.
