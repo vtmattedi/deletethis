@@ -112,6 +112,50 @@ Prints three tables:
 overlaid, band energy over time per recording, and a spectrogram per
 recording.
 
+## Live classification
+
+```
+python tools/audio/classify_live.py COM9
+python tools/audio/classify_live.py COM9 --diagnostics --log live.csv
+
+python tools/audio/classify_live.py COM9 \
+    --compressor-threshold -48 \
+    --fan-mid-threshold -63 \
+    --fan-high-threshold -68 \
+    --hold-seconds 2
+```
+
+Reads the same stream with no firmware changes and reports
+OFF / FAN / COMPRESSOR:
+
+```
+STATE=FAN  30-80=-58.2  500-1k=-57.1  1k-2k=-62.8  RMS=-41.3  candidate=FAN  stable=3.4s
+```
+
+`candidate` is what the rules say right now; `STATE` is what has held
+long enough to be published. State changes are logged on their own
+line with a timestamp.
+
+The rules are hierarchical: 30–80 Hz above the compressor threshold
+wins outright, otherwise 500–1k and/or 1k–2k above their thresholds
+means FAN, otherwise OFF. `--fan-require both` makes the second stage
+stricter.
+
+Two independent guards stop a transient becoming a state. A rolling
+median over `--median-seconds` removes single-window spikes, and
+`--hold-seconds` requires the candidate to persist before it is
+published. A 150 ms door slam does not reach the published state even
+though it is far above every threshold.
+
+Features are computed on exactly the same terms as `analyze.py` —
+verified bit-exact, not merely by eye — so a threshold read off an
+analyze.py table means the same thing here.
+
+**The default thresholds are guesses**, not measurements. They are
+there so the tool runs before you have data. Record the states, run
+`analyze.py`, and replace them with values taken from the per-state
+table and the separation ranking.
+
 ## Deciding what goes back into the firmware
 
 Read the separation table and the per-state spectra before writing any
@@ -131,5 +175,6 @@ Only then is it worth asking whether `arduinoFFT` should become
 | `capture.py` | serial -> WAV |
 | `visualize.py` | serial -> live plots |
 | `analyze.py` | WAV -> feature tables and plots |
+| `classify_live.py` | serial -> live OFF / FAN / COMPRESSOR |
 | `recordings/` | captured WAVs (git-ignored except `.gitkeep`) |
 | `plots/` | analyzer output |

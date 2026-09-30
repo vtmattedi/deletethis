@@ -95,3 +95,5 @@ Desktop.ini
 
 # Local agent configuration, not project source.
 /.claude
+tools/audio/results/*
+!tools/audio/results/.gitkeep
