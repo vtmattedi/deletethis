@@ -172,23 +172,33 @@ static constexpr size_t BAND_COUNT =
 // Helper functions
 // ============================================================
 
-uint16_t frequencyToBin(float frequency)
+// First bin whose centre frequency is at or above `frequency`.
+//
+// Band edges are half-open, [low, high), so a bin belongs to exactly
+// one band. Rounding to the nearest bin at both edges instead would
+// put the bin nearest a shared edge into both neighbouring bands and
+// count its energy twice.
+//
+// The returned value may be FFT_SAMPLES / 2, one past the last usable
+// bin, so that it also serves as an exclusive upper limit.
+uint16_t binAtOrAbove(float frequency)
 {
-    uint16_t bin = static_cast<uint16_t>(
-        round(
-            frequency *
-            FFT_SAMPLES /
-            SAMPLE_RATE
-        )
-    );
+    if (frequency <= 0.0f)
+        return 0;
 
-    const uint16_t maxBin =
-        (FFT_SAMPLES / 2) - 1;
+    const double exact =
+        static_cast<double>(frequency) *
+        FFT_SAMPLES /
+        SAMPLE_RATE;
 
-    if (bin > maxBin)
-        bin = maxBin;
+    const double bin = ceil(exact);
 
-    return bin;
+    const uint16_t limit = FFT_SAMPLES / 2;
+
+    if (bin >= limit)
+        return limit;
+
+    return static_cast<uint16_t>(bin);
 }
 
 double binToFrequency(uint16_t bin)
@@ -451,25 +461,24 @@ void analyzeFFT(
         FrequencyBand &band = bands[b];
 
         uint16_t firstBin =
-            frequencyToBin(
+            binAtOrAbove(
                 band.lowHz
             );
 
-        uint16_t lastBin =
-            frequencyToBin(
+        // Exclusive, so the bin on the boundary belongs to the
+        // band above and is not counted twice.
+        const uint16_t endBin =
+            binAtOrAbove(
                 band.highHz
             );
 
+        // Skip DC, which carries the microphone's offset.
         if (firstBin < 1)
             firstBin = 1;
 
-        if (lastBin >= FFT_SAMPLES / 2)
-            lastBin =
-                (FFT_SAMPLES / 2) - 1;
-
         for (
             uint16_t bin = firstBin;
-            bin <= lastBin;
+            bin < endBin;
             bin++
         )
         {
@@ -504,17 +513,19 @@ void analyzeFFT(
     // --------------------------------------------------------
 
     const uint16_t firstBin =
-        frequencyToBin(100.0f);
+        binAtOrAbove(100.0f);
 
-    const uint16_t lastBin =
-        frequencyToBin(4000.0f);
+    // Same half-open convention as the bands, so the search covers
+    // exactly the union of 80-200 .. 2k-4k above 100 Hz.
+    const uint16_t endBin =
+        binAtOrAbove(4000.0f);
 
     mainPeakMagnitude = 0.0;
     mainPeakFrequency = 0.0;
 
     for (
         uint16_t bin = firstBin;
-        bin <= lastBin;
+        bin < endBin;
         bin++
     )
     {

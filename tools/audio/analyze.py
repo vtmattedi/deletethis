@@ -103,6 +103,25 @@ def to_db(power: np.ndarray | float) -> np.ndarray | float:
     )
 
 
+def frame_signal(
+    signal: np.ndarray,
+    nperseg: int,
+    noverlap: int,
+) -> np.ndarray:
+    """Split into overlapping windows, aligned with ``spectrogram``.
+
+    Same segmentation scipy uses, so window *i* here is window *i*
+    there and the time axis is shared.
+    """
+    step = nperseg - noverlap
+
+    count = 1 + (signal.size - nperseg) // step
+
+    offsets = step * np.arange(count)[:, None]
+
+    return signal[offsets + np.arange(nperseg)[None, :]]
+
+
 @dataclass
 class Analysis:
     path: Path
@@ -114,8 +133,15 @@ class Analysis:
     freqs: np.ndarray            # (n_bins,)
     power: np.ndarray            # (n_bins, n_windows) mean-square per bin
 
+    # True RMS of each raw window, in dBFS. Measured in the time
+    # domain, NOT summed out of `power`: see analyse_file.
     rms_db: np.ndarray           # (n_windows,)
+
+    # Windowed spectral power per band, in dBFS. A different quantity
+    # from rms_db, on a different convention, so the two are kept
+    # apart rather than one being derived from the other.
     band_db: dict[str, np.ndarray]
+
     peak_hz: np.ndarray          # (n_windows,)
 
     @property
@@ -153,10 +179,34 @@ def analyse_file(
         mode="psd",
     )
 
-    # With scaling="spectrum", summing over frequency recovers the
-    # mean square of the window, so band sums and the overall RMS are
-    # on one consistent scale.
-    rms_db = to_db(power.sum(axis=0))
+    # ------------------------------------------------------------------
+    # Overall level: true RMS, straight from the time-domain windows.
+    #
+    # Summing `power` over frequency would be convenient but it is not
+    # the RMS of the signal. scaling="spectrum" normalises by the
+    # window's coherent gain so that a pure tone reads its true
+    # amplitude; broadband noise under that same normalisation reads
+    # high by the window's equivalent noise bandwidth, about 1.33 dB
+    # for Hamming. That is the right convention for comparing bands and
+    # for spotting a tone, and the wrong one for "how loud is it" --
+    # and the error depends on how tonal the signal is, so it does not
+    # even cancel when comparing OFF against COMPRESSOR.
+    #
+    # So the two are computed separately and neither is derived from
+    # the other: rms_db is exact, band_db is spectral.
+    # ------------------------------------------------------------------
+    windows = frame_signal(signal, nfft, noverlap)
+
+    # Match the spectrogram's detrend="constant" per window.
+    windows = windows - windows.mean(axis=1, keepdims=True)
+
+    rms_db = to_db(np.mean(windows * windows, axis=1))
+
+    if rms_db.size != times.size:
+        raise ValueError(
+            f"{path.name}: framing mismatch, "
+            f"{rms_db.size} windows vs {times.size} spectrogram columns"
+        )
 
     band_db: dict[str, np.ndarray] = {}
 
@@ -624,6 +674,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print("Per file (median over windows, dBFS)")
+    print("RMS is true time-domain level; bands are spectral power.")
     print()
     print(per_file_table(analyses))
 
@@ -631,6 +682,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print("Per state (median over all windows of all files, dBFS)")
+    print("RMS is true time-domain level; bands are spectral power.")
     print()
     print(comparison_table(grouped))
 
