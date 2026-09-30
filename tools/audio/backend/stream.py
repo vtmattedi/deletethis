@@ -74,7 +74,13 @@ class StreamService(threading.Thread):
         # Built on the first connection, once the device has told us
         # its sample rate rather than us assuming one.
         self.classifier: ClassifierService | None = None
-        self.events: EventRecorder | None = None
+        # Metadata does not depend on a live device, so saved events
+        # remain searchable/reviewable while the stream is offline.
+        self.events = EventRecorder(
+            None,
+            self.config.events,
+            self.config.events_dir,
+        )
 
         # Opened eagerly: history should survive the ESP32 being
         # unreachable, and the UI can then say so rather than showing
@@ -131,6 +137,8 @@ class StreamService(threading.Thread):
 
             with self.lock:
                 self.health.connected = False
+
+            self.history.record_connection(False, "disconnected")
 
             print("stream: disconnected")
 
@@ -203,6 +211,30 @@ class StreamService(threading.Thread):
 
         self._previous_state = decision.state
 
+    def record_manual(self) -> str | None:
+        """Start a capture at the user's request using the live state."""
+        with self.lock:
+            connected = self.health.connected
+        if not connected or self.classifier is None:
+            return None
+
+        snapshot = self.classifier.current()
+        if snapshot.state is None:
+            return None
+
+        identifier = self.events.start(
+            from_state=snapshot.state,
+            to_state=snapshot.state,
+            stable_seconds=snapshot.stable_seconds,
+            stream_time=snapshot.stream_time,
+            features=snapshot.features,
+            decision_window=self.classifier.decision_window(),
+            classifier_config=self.classifier.config,
+            source="manual",
+        )
+        print(f"event: manual capture {identifier}")
+        return identifier
+
     # -------------------------------------------------- bookkeeping
 
     def _on_connected(self, info) -> None:
@@ -220,16 +252,16 @@ class StreamService(threading.Thread):
                 self.config.classifier,
             )
 
-        if self.events is None:
-            self.events = EventRecorder(
-                info.sample_rate,
-                self.config.events,
-                self.config.events_dir,
-            )
+        self.events.set_sample_rate(info.sample_rate)
 
         # A reconnect is a discontinuity like any other.
         self.classifier.reset()
         self.events.discard_history()
+        self._break_continuity()
+
+        self.history.record_connection(
+            True, f"connected to {self.config.target}"
+        )
 
         self.ready.set()
 
@@ -254,6 +286,12 @@ class StreamService(threading.Thread):
             skip_samples=lost * info.frame_samples
         )
         self.events.discard_history()
+        self._break_continuity()
+
+        self.history.record_connection(
+            False,
+            f"gap of {lost} frame(s)",
+        )
 
         with self.lock:
             self.health.gaps += 1
@@ -266,6 +304,18 @@ class StreamService(threading.Thread):
 
         return now_missing
 
+    def _break_continuity(self) -> None:
+        """Forget what the state was before a hole in the audio.
+
+        The pre-roll is discarded at a discontinuity, so an event
+        written across one could not show what it claims: it would
+        only mean "last seen before the gap" and "first settled
+        after it", with no audio joining them. The next published
+        state becomes a fresh baseline, exactly as at startup, and
+        genuine continuous transitions are recorded normally.
+        """
+        self._previous_state = None
+
     def _update_counters(self, stream) -> None:
         with self.lock:
             self.health.lost_frames = stream.lost_frames
@@ -274,8 +324,12 @@ class StreamService(threading.Thread):
 
     def _fail(self, message: str) -> None:
         with self.lock:
+            was_connected = self.health.connected
             self.health.connected = False
             self.health.last_error = message
+
+        if was_connected:
+            self.history.record_connection(False, message)
 
         print(f"stream: {message}; retrying")
 

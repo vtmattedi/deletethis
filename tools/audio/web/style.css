@@ -43,10 +43,13 @@ td.name { color: var(--dim); }
 form { display: grid; gap: 8px; }
 label { display: grid; grid-template-columns: 1fr 88px; align-items: center; gap: 8px; }
 label span { color: var(--dim); font-size: 13px; }
-input, select {
+input, select, textarea {
   background: #11131a; color: var(--text); border: 1px solid var(--line);
   border-radius: 6px; padding: 5px 7px; font: inherit; width: 100%;
 }
+textarea { resize: vertical; min-height: 80px; }
+button:disabled { cursor: default; opacity: .45; }
+#saveSettings { margin-top: 12px; }
 .note { color: var(--dim); font-size: 12px; margin: 10px 0 0; }
 ul { list-style: none; margin: 0; padding: 0; }
 li { padding: 8px 0; border-top: 1px solid var(--line); display: flex;
@@ -69,6 +72,32 @@ audio { height: 30px; margin-left: auto; }
 li.event { cursor: pointer; }
 li.event:hover { background: #20242e; }
 li.event.open { background: #20242e; }
+.review-status { padding: 2px 8px; border-radius: 999px; font-size: 11px;
+                 text-transform: uppercase; letter-spacing: .04em; }
+.review-unreviewed { background: #343946; color: var(--dim); }
+.review-correct { background: #163f29; color: #72d99a; }
+.review-incorrect { background: #4b2424; color: #ff9c9c; }
+.event-tools, .selection-tools, .pager, .review-actions, .review-tags,
+.detail-actions {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.event-tools { margin: 12px 0 6px; }
+.event-tools input { flex: 1; min-width: 180px; }
+.event-tools .note { margin: 0 0 0 auto; }
+.selection-tools { margin: 8px 0; }
+.selection-tools .note { margin: 0; }
+.select-all { display: inline-flex; grid-template-columns: none; gap: 6px; }
+.select-all input, .event-select { width: auto; }
+.event-select { flex: 0 0 auto; }
+.pager { justify-content: center; margin-top: 12px; }
+.pager .note { margin: 0; }
+.review-form { margin-top: 18px; padding-top: 4px; border-top: 1px solid var(--line); }
+.review-form > label { margin: 8px 0; grid-template-columns: 130px 1fr; }
+.review-tags label { display: inline-flex; grid-template-columns: none; gap: 5px; }
+.review-tags input { width: auto; }
+.review-choice.active { border-color: #aab2c3; background: #303643; }
+.danger { border-color: #703535 !important; color: #ff9c9c !important; }
+.detail-actions { margin-top: 14px; justify-content: flex-end; }
 .grid2 { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
 .kv { font-variant-numeric: tabular-nums; }
 .kv td:first-child { color: var(--dim); padding-right: 14px; }

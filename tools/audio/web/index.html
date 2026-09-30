@@ -34,6 +34,7 @@
   <section class="card">
     <h2>Settings</h2>
     <form id="settings"></form>
+    <button id="saveSettings" type="button" disabled>Save changes</button>
     <p id="saved" class="note"></p>
   </section>
 
@@ -54,12 +55,37 @@
   </section>
 
   <section class="card wide">
-    <h2>Events</h2>
+    <div class="head">
+      <h2>Events</h2>
+      <button id="recordEvent" type="button">Record event now</button>
+      <span id="recordNote" class="note"></span>
+    </div>
     <p class="note">
       Written on a published state change: 15 s before and after,
-      raw PCM, with the decision that caused it.
+      raw PCM, with the decision that caused it. Browser playback is
+      boosted by +6 dB; stored WAV files are unchanged.
     </p>
+    <div class="event-tools">
+      <input id="eventSearch" type="search" placeholder="Search events and reviews">
+      <button id="eventSearchButton" type="button">Search</button>
+      <span id="eventCount" class="note"></span>
+    </div>
+    <div class="selection-tools">
+      <label class="select-all">
+        <input id="selectAllEvents" type="checkbox">
+        <span>Select this page</span>
+      </label>
+      <button id="deleteSelectedEvents" class="danger" type="button" disabled>
+        Delete selected
+      </button>
+      <span id="selectionCount" class="note">0 selected</span>
+    </div>
     <ul id="events"></ul>
+    <div class="pager">
+      <button id="previousEvents" type="button">Previous</button>
+      <span id="eventPage" class="note"></span>
+      <button id="nextEvents" type="button">Next</button>
+    </div>
   </section>
 
   <section class="card wide" id="detail" hidden>

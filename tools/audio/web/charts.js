@@ -49,7 +49,7 @@ function niceBounds(values) {
  * @param host      container element, emptied first
  * @param t         x values (seconds, any origin)
  * @param series    [{name, values}]
- * @param options   {height, states, xLabel, zeroLine}
+ * @param options   {height, states, zeroLine, outages}
  */
 export function lineChart(host, t, series, options = {}) {
   host.textContent = "";
@@ -109,6 +109,21 @@ export function lineChart(host, t, series, options = {}) {
     });
     label.textContent = value.toFixed(0);
     svg.append(label);
+  }
+
+  // Outages: the stream was down, so there is no data here rather
+  // than data saying zero. Shade them so a flat gap is not read as a
+  // quiet room.
+  for (const [from, to] of options.outages || []) {
+    const x0 = Math.max(x(from), left);
+    const x1 = Math.min(to == null ? left + plotW : x(to), left + plotW);
+
+    if (x1 <= x0) continue;
+
+    svg.append(el("rect", {
+      x: x0, y: top, width: x1 - x0, height: plotH,
+      fill: "#d64545", opacity: 0.16,
+    }));
   }
 
   // x = 0 marker (used by the event view for the transition)

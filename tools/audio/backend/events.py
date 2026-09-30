@@ -21,7 +21,9 @@ and at eventPreSeconds <= holdSeconds there is no before at all.
 from __future__ import annotations
 
 import json
+import os
 import threading
+import uuid
 import wave
 from collections import deque
 from dataclasses import dataclass, field
@@ -146,6 +148,7 @@ class PendingEvent:
     features: dict[str, float]
     decision_window: dict[str, dict[str, float]]
     classifier_config: dict
+    source: str = "transition"
 
     chunks: list[np.ndarray] = field(default_factory=list)
     collected: int = 0
@@ -165,7 +168,7 @@ class EventRecorder:
 
     def __init__(
         self,
-        sample_rate: int,
+        sample_rate: int | None,
         config: EventConfig,
         directory: Path,
     ) -> None:
@@ -185,6 +188,15 @@ class EventRecorder:
 
         self._load_existing()
 
+    def set_sample_rate(self, sample_rate: int) -> None:
+        """Set the device rate once known, before accepting PCM."""
+        with self.lock:
+            if self.sample_rate == sample_rate:
+                return
+            if self.pending or self.history:
+                raise RuntimeError("cannot change rate during capture")
+            self.sample_rate = sample_rate
+
     def _load_existing(self) -> None:
         """Index events already on disk.
 
@@ -200,6 +212,13 @@ class EventRecorder:
                 continue
 
             if isinstance(metadata, dict) and "id" in metadata:
+                if "review" not in metadata:
+                    metadata["review"] = {"status": "unreviewed"}
+                    try:
+                        self._write_json_atomic(path, metadata)
+                    except OSError:
+                        # It can still be viewed even on read-only media.
+                        pass
                 self.written.append(metadata)
 
     # ------------------------------------------------------ config
@@ -211,12 +230,14 @@ class EventRecorder:
 
     @property
     def pre_samples(self) -> int:
-        return int(self.config.pre_seconds * self.sample_rate)
+        return int(self.config.pre_seconds * (self.sample_rate or 0))
 
     # --------------------------------------------------------- PCM
 
     def push(self, samples: np.ndarray) -> list[dict]:
         """Add a frame. Returns metadata for any event just completed."""
+        if self.sample_rate is None:
+            raise RuntimeError("sample rate is not known yet")
         finished: list[dict] = []
 
         with self.lock:
@@ -279,15 +300,27 @@ class EventRecorder:
         features: dict[str, float],
         decision_window: dict[str, dict[str, float]],
         classifier_config: ClassifierConfig,
+        source: str = "transition",
     ) -> str:
+        if self.sample_rate is None:
+            raise RuntimeError("sample rate is not known yet")
         now = datetime.now()
 
-        identifier = (
+        base_identifier = (
             f"{now:%Y-%m-%d_%H%M%S}_"
             f"{from_state or 'NONE'}_to_{to_state}"
         )
 
         with self.lock:
+            identifier = base_identifier
+            existing = {
+                item.get("id") for item in self.written
+            } | {item.identifier for item in self.pending}
+            suffix = 2
+            while identifier in existing:
+                identifier = f"{base_identifier}_{suffix}"
+                suffix += 1
+
             pre = list(self.history)
 
             event = PendingEvent(
@@ -300,6 +333,7 @@ class EventRecorder:
                 features=dict(features),
                 decision_window=decision_window,
                 classifier_config=classifier_config.to_api(),
+                source=source,
                 chunks=pre,
                 collected=0,
                 wanted=int(
@@ -314,6 +348,7 @@ class EventRecorder:
     # ------------------------------------------------------- write
 
     def _write(self, event: PendingEvent) -> dict:
+        assert self.sample_rate is not None
         samples = (
             np.concatenate(event.chunks)
             if event.chunks
@@ -336,6 +371,7 @@ class EventRecorder:
             "time": event.started.isoformat(timespec="seconds"),
             "from": event.from_state,
             "to": event.to_state,
+            "source": event.source,
             "candidateHeldSeconds": round(event.stable_seconds, 2),
             "streamSeconds": round(event.stream_time, 2),
             "audio": {
@@ -355,21 +391,60 @@ class EventRecorder:
             },
             "decisionWindow": event.decision_window,
             "classifierConfig": event.classifier_config,
+            "review": {"status": "unreviewed"},
         }
 
-        json_path.write_text(
-            json.dumps(metadata, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        self._write_json_atomic(json_path, metadata)
 
         with self.lock:
             self.written.append(metadata)
 
         return metadata
 
-    def recent(self, limit: int = 50) -> list[dict]:
+    def list_events(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        search: str = "",
+    ) -> dict:
         with self.lock:
-            return list(reversed(self.written[-limit:]))
+            events = list(reversed(self.written))
+
+        query = search.strip().casefold()
+        if query:
+            events = [
+                event for event in events
+                if query in self._search_text(event)
+            ]
+
+        total = len(events)
+        start = (page - 1) * page_size
+        return {
+            "events": events[start : start + page_size],
+            "page": page,
+            "pageSize": page_size,
+            "total": total,
+            "pages": (total + page_size - 1) // page_size,
+        }
+
+    @staticmethod
+    def _search_text(metadata: dict) -> str:
+        review = metadata.get("review", {})
+        result = (
+            "unreviewed" if review.get("status") != "reviewed"
+            else "correct" if review.get("classificationCorrect")
+            else "incorrect"
+        )
+        values = [
+            metadata.get("id"), metadata.get("time"),
+            metadata.get("from"), metadata.get("to"),
+            metadata.get("source"), review.get("status"),
+            review.get("actualFrom"), review.get("actualTo"),
+            review.get("notes"),
+            result,
+            *(review.get("interference") or []),
+        ]
+        return " ".join(str(value) for value in values if value).casefold()
 
     def get(self, identifier: str) -> dict | None:
         with self.lock:
@@ -379,25 +454,94 @@ class EventRecorder:
 
         return None
 
+    def review(self, identifier: str, review: dict) -> dict | None:
+        """Replace the human review and atomically persist the JSON."""
+        with self.lock:
+            metadata = next(
+                (
+                    item for item in reversed(self.written)
+                    if item.get("id") == identifier
+                ),
+                None,
+            )
+            if metadata is None:
+                return None
+
+            updated_review = {"status": "reviewed", **review}
+            updated = {**metadata, "review": updated_review}
+            path = self._event_path(identifier, ".json")
+            if path is None:
+                return None
+            self._write_json_atomic(path, updated)
+            metadata["review"] = updated_review
+            return dict(metadata)
+
+    def delete(self, identifier: str) -> bool:
+        """Delete one completed event's self-contained JSON/WAV pair."""
+        with self.lock:
+            index = next(
+                (
+                    i for i, item in enumerate(self.written)
+                    if item.get("id") == identifier
+                ),
+                None,
+            )
+            if index is None:
+                return False
+
+            paths = [
+                self._event_path(identifier, suffix)
+                for suffix in (".json", ".wav")
+            ]
+            if any(path is None for path in paths):
+                return False
+            for path in paths:
+                try:
+                    assert path is not None
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            self.written.pop(index)
+            return True
+
+    @staticmethod
+    def _write_json_atomic(path: Path, metadata: dict) -> None:
+        temporary = path.with_name(
+            f".{path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(metadata, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
     def wav_path(self, identifier: str) -> Path | None:
         """Resolve an id to a file, refusing anything outside the dir.
 
         The id arrives from a URL, so it must not be able to name a
         path of its own.
         """
-        path = (self.directory / f"{identifier}.wav").resolve()
-
-        if self.directory.resolve() not in path.parents:
+        path = self._event_path(identifier, ".wav")
+        if path is None:
             return None
-
         return path if path.is_file() else None
+
+    def _event_path(self, identifier: str, suffix: str) -> Path | None:
+        path = (self.directory / f"{identifier}{suffix}").resolve()
+        return path if self.directory.resolve() in path.parents else None
 
     def status(self) -> dict:
         with self.lock:
             return {
                 "buffered": round(
                     self.history_samples / self.sample_rate, 1
-                ),
+                ) if self.sample_rate else 0.0,
                 "pending": len(self.pending),
                 "written": len(self.written),
             }

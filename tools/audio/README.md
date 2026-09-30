@@ -30,8 +30,13 @@ cp include/creds.example.h include/creds.h     # then fill it in
 
 ```
 TCP     binary audio, and nothing else
-Serial  commands, status and logs, and nothing else
+Serial  status and connection state, and nothing else
 ```
+
+The device captures and forwards. It does not analyse: there is no FFT
+on the ESP32 and no audio diagnostics on Serial. Every band, threshold
+and rule lives in the PC tools, where it can be changed without a
+reflash, and `arduinoFFT` is no longer a dependency.
 
 Nothing has to arbitrate who owns Serial, because audio never goes
 there. A log line cannot land in the middle of a PCM frame, so the
@@ -56,19 +61,19 @@ connection is refused rather than queued.
 
 | Command | Effect |
 | --- | --- |
-| `t` | TEXT mode: periodic RMS / band / peak diagnostics |
-| `s` | IDLE: stop the diagnostics |
-| `?` | status: sample rate, IP, port, client, I2S overruns |
+| `?` | status: sample rate, frame size, uptime, IP, port, client, I2S overruns |
 | `c` | prints `# capture over serial disabled; use TCP` |
 
 Serial also logs Wi-Fi up/down, client connect and disconnect, and
-I2S overruns as they occur.
+I2S overruns as they occur. It says nothing else: there is no
+periodic output to scroll past while you are watching for a
+connection problem.
 
 Streaming audio over serial still exists as a fallback: set
 `ALLOW_SERIAL_CAPTURE` to 1 in `src/main.cpp`, reflash, and the tools
 accept `COM9` again. It is off by default so the invariant above
-holds. 16 kHz x 4 bytes is 64 kB/s, which
-does not fit in 115200 baud. If your USB-serial adapter cannot hold
+holds; it re-adds the `c` and `s` commands. 16 kHz x 4 bytes is
+64 kB/s, which does not fit in 115200 baud. If your USB-serial adapter cannot hold
 921600, lower `SERIAL_BAUD` in `src/main.cpp` and pass the same value
 to `--baud` — but below about 700000 baud the stream will drop frames.
 
@@ -280,10 +285,14 @@ never classifies and never talks to the ESP32.
 | `GET /api/status` | stream health, state, features, config |
 | `GET /api/config` | current thresholds and timings |
 | `PATCH /api/config` | change them live |
-| `GET /api/events` | recorded transitions, newest first |
+| `GET /api/events?page=1&pageSize=20&search=fan` | paged/searchable saved events, newest first |
+| `POST /api/events/manual` | start a manual pre/post-roll capture |
+| `DELETE /api/events` | delete a bundle supplied as `{ "ids": [...] }` |
 | `GET /api/events/{id}` | one event's full metadata |
 | `GET /api/events/{id}/audio` | that event's WAV |
 | `GET /api/events/{id}/timeline` | feature timeline recomputed from the WAV |
+| `PATCH /api/events/{id}/review` | save human labels in the event JSON |
+| `DELETE /api/events/{id}` | delete the event JSON and WAV |
 | `GET /api/history` | compact state history |
 | `WS /ws/live` | snapshots, 5 Hz by default |
 
@@ -312,7 +321,17 @@ config in force at the time. Overlapping captures are independent: a
 second transition during the first's tail starts its own event.
 
 The classifier's *first* verdict after startup is not a transition and
-is not recorded — it is the classifier settling, not a change.
+is not recorded — it is the classifier settling, not a change. The
+same applies after any discontinuity: a TCP dropout, a reconnect or an
+I2S gap clears the pre-roll, so the next published state is a fresh
+baseline rather than the far side of a transition.
+
+That matters because the alternative is a lie. If the air conditioner
+changes while the stream is down, an event written across the gap
+would claim to show FAN → COMPRESSOR while containing no audio joining
+the two — only "last seen before" and "first settled after". Those
+events are suppressed; the connection events in the history are what
+records that something was missed.
 
 Note that a transition publishes `holdSeconds` after the audio really
 changed, so that much of the pre-roll is already the new state. At the
@@ -320,22 +339,46 @@ defaults (15 s pre-roll against a 2.5 s decision) there is plenty of
 genuine "before"; raising `holdSeconds` towards `eventPreSeconds` eats
 into it.
 
+The browser's **Record event now** button starts the same pre/post-roll
+capture without requiring a transition. These records have
+`"source": "manual"` and use the current state for both `from` and
+`to`. Every new event starts with `review.status = "unreviewed"`.
+Reviewing it stores the human `actualFrom` / `actualTo`, correctness,
+interference tags and notes atomically in that JSON; it never changes
+the original classifier result or WAV. Older JSON files are migrated
+to an unreviewed review block when indexed.
+
 ### History
 
 One row per second in SQLite at `results/audio.db`: state, candidate,
-hold, RMS, the four bands, and stream health. About 86k rows a day,
-which SQLite does not notice. The ~31 classifier windows per second
-are deliberately *not* stored — they only matter around a transition,
-and that is what the event WAVs are for.
+hold, RMS, the four bands, and the frame counters. About 86k rows a
+day, which SQLite does not notice. The ~31 classifier windows per
+second are deliberately *not* stored — they only matter around a
+transition, and that is what the event WAVs are for.
 
 ```
 GET /api/history?seconds=900
 GET /api/history?from=2026-09-30T13:00:00&to=2026-09-30T14:00:00
+GET /api/history?seconds=86400&points=500
 ```
 
 `from` and `to` accept a unix timestamp or an ISO-8601 string. The
-response is columnar, because the only consumer is a chart. The UI
-plots RMS and the three rule bands with a state strip underneath.
+response is columnar, because the only consumer is a chart.
+
+**Long ranges are bucketed, not truncated.** Up to `points` (2000 by
+default) rows come back as-is; beyond that the whole range is divided
+into that many buckets, numeric columns averaged and state taken from
+the last row in each. A `LIMIT` would have returned the first few
+hours of a day and called it a day — which is worse than useless,
+because it looks like data. The response says `downsampled` and
+`bucketSeconds` so the UI can label it.
+
+There is no `stream_connected` column. Rows are only written while
+audio is arriving, so it was always 1 and an outage showed up as a
+hole in the timestamps. Connect and disconnect are recorded properly
+in a `connection` table instead, returned alongside the history and
+shaded on the chart — including the event immediately *before* the
+range, without which the browser cannot know how the range opened.
 
 ### Event timeline
 
@@ -369,8 +412,9 @@ energies, a spectral ratio, and a few seconds of temporal persistence
 so a door slam cannot flip the state. Porting three numbers you have
 evidence for beats porting a model you cannot debug over serial.
 
-Only then is it worth asking whether `arduinoFFT` should become
-`esp-dsp`. Until the features are settled, it does not matter.
+The firmware no longer links `arduinoFFT` at all, so porting features
+back means adding an FFT again — `esp-dsp` is the one to reach for at
+that point, not the Arduino library that was there before.
 
 ## Files
 

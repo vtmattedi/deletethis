@@ -23,21 +23,23 @@ if __package__ in (None, ""):
     from backend.config import ClassifierConfig
     from backend.events import event_timeline
     from backend.history import to_epoch
-    from backend.models import ConfigPatch
+    from backend.models import ConfigPatch, EventDeleteRequest, ReviewPatch
     from backend.stream import StreamService
 else:
     from . import config as config_module
     from .config import ClassifierConfig
     from .events import event_timeline
     from .history import to_epoch
-    from .models import ConfigPatch
+    from .models import ConfigPatch, EventDeleteRequest, ReviewPatch
     from .stream import StreamService
 
 import uvicorn
 from fastapi import (
     FastAPI,
     HTTPException,
+    Query,
     Request,
+    Response,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -47,20 +49,48 @@ from fastapi.staticfiles import StaticFiles
 AppConfig = config_module.AppConfig
 
 
+def _is_benign_proactor_reset(context: dict) -> bool:
+    """Recognize Windows' noisy reset while closing a client socket."""
+    error = context.get("exception")
+    callback = " ".join(
+        str(context.get(key, "")) for key in ("message", "handle")
+    )
+    return (
+        sys.platform == "win32"
+        and isinstance(error, ConnectionResetError)
+        and getattr(error, "winerror", None) == 10054
+        and "_ProactorBasePipeTransport._call_connection_lost" in callback
+    )
+
+
 def create_app(settings: AppConfig) -> FastAPI:
     service = StreamService(settings)
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
+        loop = asyncio.get_running_loop()
+        previous_exception_handler = loop.get_exception_handler()
+
+        def handle_asyncio_exception(loop, context: dict) -> None:
+            if _is_benign_proactor_reset(context):
+                return
+            if previous_exception_handler is not None:
+                previous_exception_handler(loop, context)
+            else:
+                loop.default_exception_handler(context)
+
+        loop.set_exception_handler(handle_asyncio_exception)
         service.start()
 
         print(f"Web: http://{settings.http_host}:{settings.http_port}")
 
-        yield
-
-        service.stop()
-        service.join(timeout=3.0)
-        service.close()
+        try:
+            yield
+        finally:
+            loop.set_exception_handler(previous_exception_handler)
+            service.stop()
+            service.join(timeout=3.0)
+            service.close()
 
     app = FastAPI(title="INMP441 audio backend", lifespan=lifespan)
 
@@ -107,11 +137,40 @@ def create_app(settings: AppConfig) -> FastAPI:
     # ------------------------------------------------------ events
 
     @app.get("/api/events")
-    async def get_events() -> dict:
+    async def get_events(
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, alias="pageSize", ge=1, le=100),
+        search: str = Query(default="", max_length=200),
+    ) -> dict:
         if service.events is None:
-            return {"events": []}
+            return {
+                "events": [], "page": page, "pageSize": page_size,
+                "total": 0, "pages": 0,
+            }
 
-        return {"events": service.events.recent()}
+        return service.events.list_events(page, page_size, search)
+
+    @app.post("/api/events/manual", status_code=202)
+    async def record_manual_event() -> dict:
+        identifier = service.record_manual()
+        if identifier is None:
+            raise HTTPException(
+                status_code=409,
+                detail="audio stream has not produced a state yet",
+            )
+        return {"id": identifier, "status": "recording"}
+
+    @app.delete("/api/events")
+    async def delete_events(request: EventDeleteRequest) -> dict:
+        deleted = []
+        not_found = []
+        # Preserve request order but never process one event twice.
+        for identifier in dict.fromkeys(request.ids):
+            if service.events.delete(identifier):
+                deleted.append(identifier)
+            else:
+                not_found.append(identifier)
+        return {"deleted": deleted, "notFound": not_found}
 
     @app.get("/api/events/{identifier}")
     async def get_event(identifier: str) -> dict:
@@ -138,6 +197,34 @@ def create_app(settings: AppConfig) -> FastAPI:
             raise HTTPException(status_code=404, detail="no such event")
 
         return FileResponse(path, media_type="audio/wav")
+
+    @app.patch("/api/events/{identifier}/review")
+    async def patch_event_review(
+        identifier: str, patch: ReviewPatch
+    ) -> dict:
+        metadata = (
+            service.events.review(identifier, patch.model_dump())
+            if service.events is not None
+            else None
+        )
+        if metadata is None:
+            raise HTTPException(status_code=404, detail="no such event")
+        return metadata
+
+    @app.delete(
+        "/api/events/{identifier}",
+        status_code=204,
+        response_class=Response,
+    )
+    async def delete_event(identifier: str) -> Response:
+        deleted = (
+            service.events.delete(identifier)
+            if service.events is not None
+            else False
+        )
+        if not deleted:
+            raise HTTPException(status_code=404, detail="no such event")
+        return Response(status_code=204)
 
     @app.get("/api/events/{identifier}/timeline")
     def get_event_timeline(identifier: str) -> dict:
@@ -177,7 +264,7 @@ def create_app(settings: AppConfig) -> FastAPI:
     def get_history(
         request: Request,
         seconds: float = 900.0,
-        limit: int = 20000,
+        points: int = 2000,
     ) -> dict:
         """Compact state history. `from`/`to` accept epoch or ISO.
 
@@ -196,7 +283,7 @@ def create_app(settings: AppConfig) -> FastAPI:
         if start > end:
             start, end = end, start
 
-        return service.history.query(start, end, limit)
+        return service.history.query(start, end, points)
 
     # -------------------------------------------------------- live
 

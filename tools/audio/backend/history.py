@@ -25,6 +25,10 @@ BAND_COLUMNS = {
     "200-1200": "band_200_1200",
 }
 
+# stream_connected is gone: rows are only written while audio is
+# arriving, so it was always 1 and downtime showed up as a hole in the
+# timestamps rather than as rows saying so. Outages are recorded
+# properly in the `connection` table instead.
 COLUMNS = [
     "t",
     "state",
@@ -32,10 +36,19 @@ COLUMNS = [
     "stable_seconds",
     "rms",
     *BAND_COLUMNS.values(),
-    "stream_connected",
     "lost_frames",
     "device_dropped",
 ]
+
+# Averaged when a bucket covers several rows.
+NUMERIC_COLUMNS = [
+    "stable_seconds",
+    "rms",
+    *BAND_COLUMNS.values(),
+]
+
+# Cumulative counters: the largest in the bucket is the one that counts.
+COUNTER_COLUMNS = ["lost_frames", "device_dropped"]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS history (
@@ -52,13 +65,20 @@ CREATE TABLE IF NOT EXISTS history (
     lost_frames      INTEGER,
     device_dropped   INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS connection (
+    t         REAL PRIMARY KEY,
+    connected INTEGER,
+    detail    TEXT
+);
 """
 
 DEFAULT_INTERVAL_SECONDS = 1.0
 
-# A plot cannot use more points than it has pixels, and a wide range
-# should not turn into a 100 MB response.
-MAX_ROWS = 20000
+# A plot cannot use more points than it has pixels. Beyond this the
+# range is bucketed rather than cut short: a day must look like a day,
+# not like the first few hours of one.
+MAX_POINTS = 2000
 
 
 def to_epoch(value: str | float | None, fallback: float) -> float:
@@ -141,7 +161,6 @@ class HistoryStore:
                 round(features.get(band, -120.0), 2)
                 for band in BAND_COLUMNS
             ],
-            1 if health.connected else 0,
             health.lost_frames,
             health.device_dropped,
         ]
@@ -166,36 +185,143 @@ class HistoryStore:
         self,
         start: float,
         end: float,
-        limit: int = MAX_ROWS,
+        max_points: int = MAX_POINTS,
     ) -> dict:
         """Columnar, because the only consumer is a chart.
 
-        Row-per-object JSON would trade a few times the bytes for a
-        shape the browser would immediately have to transpose anyway.
+        Over a long range the rows are bucketed rather than cut off. A
+        LIMIT would have returned the first few hours of a day and
+        called it a day, which is worse than useless: it looks like
+        data.
         """
-        limit = max(1, min(limit, MAX_ROWS))
+        max_points = max(2, min(max_points, MAX_POINTS))
 
         with self.lock:
-            rows = self.connection.execute(
-                "SELECT * FROM history "
-                "WHERE t >= ? AND t <= ? "
-                "ORDER BY t LIMIT ?",
-                (start, end, limit),
-            ).fetchall()
+            total = self.connection.execute(
+                "SELECT COUNT(*) FROM history WHERE t >= ? AND t <= ?",
+                (start, end),
+            ).fetchone()[0]
+
+        if total <= max_points:
+            rows = self._raw(start, end)
+            bucket = 0.0
+        else:
+            bucket = (end - start) / max_points
+            rows = self._bucketed(start, end, bucket)
 
         columns: dict[str, list] = {name: [] for name in COLUMNS}
 
         for row in rows:
             for name in COLUMNS:
-                columns[name].append(row[name])
+                value = row[name]
+
+                columns[name].append(
+                    round(value, 2)
+                    if isinstance(value, float) and name != "t"
+                    else value
+                )
 
         return {
             "from": start,
             "to": end,
             "count": len(rows),
-            "truncated": len(rows) >= limit,
+            "total": total,
+            "downsampled": bucket > 0.0,
+            "bucketSeconds": round(bucket, 3),
             "columns": columns,
+            "connection": self.connection_events(start, end),
         }
+
+    def _raw(self, start: float, end: float) -> list:
+        names = ", ".join(COLUMNS)
+
+        with self.lock:
+            return self.connection.execute(
+                f"SELECT {names} FROM history "
+                "WHERE t >= ? AND t <= ? ORDER BY t",
+                (start, end),
+            ).fetchall()
+
+    def _bucketed(
+        self, start: float, end: float, bucket: float
+    ) -> list:
+        """One row per bucket: averages, plus the bucket's last state.
+
+        The bare `state` and `candidate` columns take their values from
+        the row holding MAX(t), which is SQLite's documented behaviour
+        when a query has exactly one max() aggregate. A state change
+        inside a bucket is therefore rounded to the end of it -- fine
+        for an overview, and the event list is where exact transitions
+        live anyway.
+        """
+        averages = ", ".join(
+            f"AVG({name}) AS {name}" for name in NUMERIC_COLUMNS
+        )
+
+        counters = ", ".join(
+            f"MAX({name}) AS {name}" for name in COUNTER_COLUMNS
+        )
+
+        with self.lock:
+            return self.connection.execute(
+                f"SELECT MAX(t) AS t, state, candidate, "
+                f"{averages}, {counters} "
+                "FROM history WHERE t >= ? AND t <= ? "
+                "GROUP BY CAST((t - ?) / ? AS INTEGER) "
+                "ORDER BY t",
+                (start, end, start, bucket),
+            ).fetchall()
+
+    # ------------------------------------------ connection events
+
+    def record_connection(
+        self, connected: bool, detail: str = ""
+    ) -> None:
+        """Note that the stream came up or went down.
+
+        History rows are only written while audio is arriving, so an
+        outage is a hole in the timestamps. These rows say what the
+        hole was, which a hole cannot.
+        """
+        moment = time.time()
+
+        with self.lock:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO connection "
+                "(t, connected, detail) VALUES (?, ?, ?)",
+                (moment, 1 if connected else 0, detail),
+            )
+            self.connection.commit()
+
+    def connection_events(
+        self, start: float, end: float, limit: int = 500
+    ) -> list[dict]:
+        """Events in the range, plus the one before it.
+
+        Without the preceding event the browser cannot know whether the
+        range opened connected or disconnected.
+        """
+        with self.lock:
+            before = self.connection.execute(
+                "SELECT t, connected, detail FROM connection "
+                "WHERE t < ? ORDER BY t DESC LIMIT 1",
+                (start,),
+            ).fetchall()
+
+            inside = self.connection.execute(
+                "SELECT t, connected, detail FROM connection "
+                "WHERE t >= ? AND t <= ? ORDER BY t LIMIT ?",
+                (start, end, limit),
+            ).fetchall()
+
+        return [
+            {
+                "t": row["t"],
+                "connected": bool(row["connected"]),
+                "detail": row["detail"] or "",
+            }
+            for row in list(before) + list(inside)
+        ]
 
     def span(self) -> dict:
         with self.lock:

@@ -1,9 +1,4 @@
-"""API request models.
-
-Only what the milestone needs: validation for PATCH /api/config.
-Responses are plain dicts built by the services that own the data,
-so there is no second description of the same shape to keep in sync.
-"""
+"""Validation models for mutating API requests."""
 
 from __future__ import annotations
 
@@ -44,3 +39,26 @@ class ConfigPatch(BaseModel):
 
     def changes(self) -> dict:
         return self.model_dump(exclude_none=True)
+
+
+StateLabel = Literal["OFF", "FAN", "COMPRESSOR", "UNKNOWN"]
+
+
+class ReviewPatch(BaseModel):
+    """A completed human review of the classifier result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    classificationCorrect: bool
+    actualFrom: StateLabel
+    actualTo: StateLabel
+    interference: list[str] = Field(default_factory=list)
+    notes: str = Field(default="", max_length=10000)
+
+
+class EventDeleteRequest(BaseModel):
+    """A bounded bundle of saved event identifiers to remove."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ids: list[str] = Field(min_length=1, max_length=100)

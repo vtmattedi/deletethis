@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <driver/i2s.h>
-#include <arduinoFFT.h>
 #include <WiFi.h>
 #include <math.h>
 
@@ -43,20 +42,17 @@
 static constexpr uint32_t SERIAL_BAUD = 921600;
 
 // ============================================================
-// Audio / FFT configuration
+// Audio
+//
+// The device captures and forwards. It does not analyse: every
+// FFT, band and threshold lives in the PC tools, where a rule
+// can be changed without a reflash. Serial is for status and
+// connection state only.
 // ============================================================
 
 static constexpr uint32_t SAMPLE_RATE = 16000;
-static constexpr uint16_t FFT_SAMPLES = 1024;
 
-static_assert(
-    (FFT_SAMPLES & (FFT_SAMPLES - 1)) == 0,
-    "FFT_SAMPLES must be a power of 2"
-);
-
-static constexpr double FULL_SCALE_24BIT = 8388608.0;
-
-// Ignore the first few captures after I2S startup.
+// Ignore the first few frames after I2S startup.
 static constexpr uint8_t STARTUP_FRAMES_TO_IGNORE = 5;
 
 // I2S driver event queue, used to see DMA overruns.
@@ -150,14 +146,8 @@ static_assert(
 
 #define ALLOW_SERIAL_CAPTURE 0
 
-enum class Mode
-{
-    TEXT,
-    CAPTURE,   // unreachable unless ALLOW_SERIAL_CAPTURE
-    IDLE
-};
-
-static Mode mode = Mode::TEXT;
+// Only meaningful when ALLOW_SERIAL_CAPTURE is 1.
+static bool serialCapture = false;
 
 // ============================================================
 // Network
@@ -193,6 +183,9 @@ static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
 // derive from Print, so this stays a tag and a pointer rather
 // than a class hierarchy.
 // ============================================================
+
+// One frame of audio, right-aligned by readPcmFrame().
+int32_t i2sSamples[FRAME_SAMPLES];
 
 struct StreamSink
 {
@@ -279,109 +272,6 @@ bool writeAll(
     }
 
     return true;
-}
-
-// ============================================================
-// Buffers
-// ============================================================
-
-double vReal[FFT_SAMPLES];
-double vImag[FFT_SAMPLES];
-
-int32_t i2sSamples[FFT_SAMPLES];
-
-// The same buffer serves CAPTURE mode, which needs only
-// FRAME_SAMPLES of it.
-static_assert(
-    FRAME_SAMPLES <= FFT_SAMPLES,
-    "FRAME_SAMPLES must fit in the I2S buffer"
-);
-
-ArduinoFFT<double> FFT(
-    vReal,
-    vImag,
-    FFT_SAMPLES,
-    SAMPLE_RATE
-);
-
-// ============================================================
-// Frequency band structure
-// ============================================================
-
-struct FrequencyBand
-{
-    const char *name;
-
-    float lowHz;
-    float highHz;
-
-    double energy;
-    double peakMagnitude;
-    double peakFrequency;
-};
-
-FrequencyBand bands[] =
-{
-    {"30-80",    30.0f,   80.0f,   0, 0, 0},
-    {"80-200",   80.0f,   200.0f,  0, 0, 0},
-    {"200-500",  200.0f,  500.0f,  0, 0, 0},
-    {"500-1k",   500.0f,  1000.0f, 0, 0, 0},
-    {"1k-2k",    1000.0f, 2000.0f, 0, 0, 0},
-    {"2k-4k",    2000.0f, 4000.0f, 0, 0, 0},
-};
-
-static constexpr size_t BAND_COUNT =
-    sizeof(bands) / sizeof(bands[0]);
-
-// ============================================================
-// Helper functions
-// ============================================================
-
-// First bin whose centre frequency is at or above `frequency`.
-//
-// Band edges are half-open, [low, high), so a bin belongs to exactly
-// one band. Rounding to the nearest bin at both edges instead would
-// put the bin nearest a shared edge into both neighbouring bands and
-// count its energy twice.
-//
-// The returned value may be FFT_SAMPLES / 2, one past the last usable
-// bin, so that it also serves as an exclusive upper limit.
-uint16_t binAtOrAbove(float frequency)
-{
-    if (frequency <= 0.0f)
-        return 0;
-
-    const double exact =
-        static_cast<double>(frequency) *
-        FFT_SAMPLES /
-        SAMPLE_RATE;
-
-    const double bin = ceil(exact);
-
-    const uint16_t limit = FFT_SAMPLES / 2;
-
-    if (bin >= limit)
-        return limit;
-
-    return static_cast<uint16_t>(bin);
-}
-
-double binToFrequency(uint16_t bin)
-{
-    return
-        static_cast<double>(bin) *
-        SAMPLE_RATE /
-        FFT_SAMPLES;
-}
-
-void resetBands()
-{
-    for (size_t i = 0; i < BAND_COUNT; i++)
-    {
-        bands[i].energy = 0;
-        bands[i].peakMagnitude = 0;
-        bands[i].peakFrequency = 0;
-    }
 }
 
 // ============================================================
@@ -499,315 +389,6 @@ size_t readSamples(size_t wanted)
     return bytesRead / sizeof(int32_t);
 }
 
-bool captureAudio()
-{
-    const size_t sampleCount =
-        readSamples(FFT_SAMPLES);
-
-    if (sampleCount == 0)
-    {
-        Serial.println("I2S read error.");
-        return false;
-    }
-
-    if (sampleCount != FFT_SAMPLES)
-    {
-        Serial.printf(
-            "Short read: %u / %u samples\n",
-            static_cast<unsigned>(sampleCount),
-            FFT_SAMPLES
-        );
-
-        return false;
-    }
-
-    return true;
-}
-
-// ============================================================
-// Audio preprocessing
-// ============================================================
-
-void preprocessAudio(
-    double &rms,
-    double &peak,
-    double &dbFS,
-    double &dcOffset
-)
-{
-    double sum = 0.0;
-
-    // --------------------------------------------------------
-    // INMP441 sends 24-bit audio in a 32-bit I2S word.
-    //
-    // The useful signed data is normally in the upper
-    // 24 bits, hence >> 8.
-    // --------------------------------------------------------
-
-    for (uint16_t i = 0; i < FFT_SAMPLES; i++)
-    {
-        int32_t sample = i2sSamples[i] >> 8;
-
-        vReal[i] =
-            static_cast<double>(sample);
-
-        vImag[i] = 0.0;
-
-        sum += vReal[i];
-    }
-
-    dcOffset =
-        sum / FFT_SAMPLES;
-
-    double squareSum = 0.0;
-    peak = 0.0;
-
-    // Remove DC before FFT.
-    for (uint16_t i = 0; i < FFT_SAMPLES; i++)
-    {
-        const double sample =
-            vReal[i] - dcOffset;
-
-        vReal[i] = sample;
-
-        const double absSample =
-            fabs(sample);
-
-        if (absSample > peak)
-            peak = absSample;
-
-        squareSum += sample * sample;
-    }
-
-    rms =
-        sqrt(
-            squareSum /
-            FFT_SAMPLES
-        );
-
-    if (rms > 0.0)
-    {
-        dbFS =
-            20.0 *
-            log10(
-                rms /
-                FULL_SCALE_24BIT
-            );
-    }
-    else
-    {
-        dbFS = -120.0;
-    }
-}
-
-// ============================================================
-// FFT analysis
-// ============================================================
-
-void analyzeFFT(
-    double &mainPeakFrequency,
-    double &mainPeakMagnitude
-)
-{
-    FFT.windowing(
-        FFTWindow::Hamming,
-        FFTDirection::Forward
-    );
-
-    FFT.compute(
-        FFTDirection::Forward
-    );
-
-    FFT.complexToMagnitude();
-
-    resetBands();
-
-    // --------------------------------------------------------
-    // Analyze predefined frequency bands.
-    // --------------------------------------------------------
-
-    for (size_t b = 0; b < BAND_COUNT; b++)
-    {
-        FrequencyBand &band = bands[b];
-
-        uint16_t firstBin =
-            binAtOrAbove(
-                band.lowHz
-            );
-
-        // Exclusive, so the bin on the boundary belongs to the
-        // band above and is not counted twice.
-        const uint16_t endBin =
-            binAtOrAbove(
-                band.highHz
-            );
-
-        // Skip DC, which carries the microphone's offset.
-        if (firstBin < 1)
-            firstBin = 1;
-
-        for (
-            uint16_t bin = firstBin;
-            bin < endBin;
-            bin++
-        )
-        {
-            const double magnitude =
-                vReal[bin];
-
-            // Magnitude-squared is a better approximation
-            // of spectral energy than summing magnitudes.
-            band.energy +=
-                magnitude *
-                magnitude;
-
-            if (
-                magnitude >
-                band.peakMagnitude
-            )
-            {
-                band.peakMagnitude =
-                    magnitude;
-
-                band.peakFrequency =
-                    binToFrequency(bin);
-            }
-        }
-    }
-
-    // --------------------------------------------------------
-    // Global useful peak
-    //
-    // Ignore everything below 100 Hz so mains / movement
-    // does not permanently win.
-    // --------------------------------------------------------
-
-    const uint16_t firstBin =
-        binAtOrAbove(100.0f);
-
-    // Same half-open convention as the bands, so the search covers
-    // exactly the union of 80-200 .. 2k-4k above 100 Hz.
-    const uint16_t endBin =
-        binAtOrAbove(4000.0f);
-
-    mainPeakMagnitude = 0.0;
-    mainPeakFrequency = 0.0;
-
-    for (
-        uint16_t bin = firstBin;
-        bin < endBin;
-        bin++
-    )
-    {
-        const double magnitude =
-            vReal[bin];
-
-        if (
-            magnitude >
-            mainPeakMagnitude
-        )
-        {
-            mainPeakMagnitude =
-                magnitude;
-
-            mainPeakFrequency =
-                binToFrequency(bin);
-        }
-    }
-}
-
-// ============================================================
-// Output
-// ============================================================
-
-void printResults(
-    double rms,
-    double peak,
-    double dbFS,
-    double dcOffset,
-    double mainPeakFrequency,
-    double mainPeakMagnitude
-)
-{
-    Serial.println();
-    Serial.println(
-        "------------------------------------------------------------"
-    );
-
-    Serial.printf(
-        "RMS=%10.0f  "
-        "Peak=%10.0f  "
-        "dBFS=%7.2f  "
-        "DC=%10.0f\n",
-        rms,
-        peak,
-        dbFS,
-        dcOffset
-    );
-
-    Serial.printf(
-        "Main >100Hz: %7.1f Hz  "
-        "FFT=%12.0f\n",
-        mainPeakFrequency,
-        mainPeakMagnitude
-    );
-
-    Serial.println();
-    Serial.println(
-        "Band         Energy              Peak Hz      Peak FFT"
-    );
-
-    for (size_t i = 0; i < BAND_COUNT; i++)
-    {
-        const FrequencyBand &band =
-            bands[i];
-
-        Serial.printf(
-            "%-10s %16.3e   %8.1f   %12.0f\n",
-            band.name,
-            band.energy,
-            band.peakFrequency,
-            band.peakMagnitude
-        );
-    }
-}
-
-// ============================================================
-// Processing
-// ============================================================
-
-void processAudio()
-{
-    double rms = 0;
-    double peak = 0;
-    double dbFS = 0;
-    double dcOffset = 0;
-
-    double mainPeakFrequency = 0;
-    double mainPeakMagnitude = 0;
-
-    preprocessAudio(
-        rms,
-        peak,
-        dbFS,
-        dcOffset
-    );
-
-    analyzeFFT(
-        mainPeakFrequency,
-        mainPeakMagnitude
-    );
-
-    printResults(
-        rms,
-        peak,
-        dbFS,
-        dcOffset,
-        mainPeakFrequency,
-        mainPeakMagnitude
-    );
-}
-
 // ============================================================
 // CAPTURE mode
 // ============================================================
@@ -905,8 +486,10 @@ void drainI2sEvents()
     // Safe to say so on Serial, because Serial never carries
     // audio. Throttled, since an overrun tends to arrive with
     // friends and the log is meant to be readable.
-    if (mode == Mode::CAPTURE)
+#if ALLOW_SERIAL_CAPTURE
+    if (serialCapture)
         return;
+#endif
 
     const uint32_t now = millis();
 
@@ -1106,69 +689,56 @@ bool tcpClientStreaming()
 //   ?  status line   (ignored while capturing)
 // ============================================================
 
-void enterMode(Mode next)
+#if ALLOW_SERIAL_CAPTURE
+void startSerialCapture()
 {
-    if (next == mode)
+    if (serialCapture)
         return;
 
-    if (mode == Mode::CAPTURE)
+    if (tcpClientStreaming())
     {
-        // Let the host see a clean end of stream before any
-        // text is mixed in.
-        Serial.flush();
+        // Only one binary destination at a time, so the 64 kB/s
+        // stream is never sent twice.
+        Serial.println();
+        Serial.println(
+            "# a TCP client is streaming; disconnect it first"
+        );
+
+        return;
     }
 
-    mode = next;
+    frameSequence = 0;
+    pendingDropped = 0;
 
-    switch (mode)
-    {
-        case Mode::TEXT:
-            Serial.println();
-            Serial.println("# mode=TEXT");
-            break;
+    i2s_zero_dma_buffer(I2S_PORT);
 
-        case Mode::CAPTURE:
-            if (tcpClientStreaming())
-            {
-                // Only one binary destination at a time, so the
-                // 64 kB/s stream is never sent twice.
-                mode = Mode::TEXT;
+    StreamSink sink = serialSink();
 
-                Serial.println();
-                Serial.println(
-                    "# a TCP client is streaming; "
-                    "disconnect it first"
-                );
-
-                break;
-            }
-
-            frameSequence = 0;
-            pendingDropped = 0;
-
-            i2s_zero_dma_buffer(I2S_PORT);
-
-            {
-                StreamSink sink = serialSink();
-                sendStreamHeader(sink);
-            }
-            break;
-
-        case Mode::IDLE:
-            Serial.println();
-            Serial.println("# mode=IDLE");
-            break;
-    }
+    if (sendStreamHeader(sink))
+        serialCapture = true;
 }
+
+void stopSerialCapture()
+{
+    if (!serialCapture)
+        return;
+
+    Serial.flush();
+    serialCapture = false;
+
+    Serial.println();
+    Serial.println("# serial capture stopped");
+}
+#endif
 
 void printStatus()
 {
     Serial.printf(
-        "# sample_rate=%u fft=%u frame=%u baud=%u\n",
+        "# sample_rate=%u frame=%u baud=%u uptime=%lus\n",
         SAMPLE_RATE,
-        FFT_SAMPLES,
         FRAME_SAMPLES,
-        SERIAL_BAUD
+        SERIAL_BAUD,
+        millis() / 1000UL
     );
 
     if (WiFi.status() == WL_CONNECTED)
@@ -1194,15 +764,10 @@ void handleCommands()
 
         switch (c)
         {
-            case 't':
-            case 'T':
-                enterMode(Mode::TEXT);
-                break;
-
             case 'c':
             case 'C':
 #if ALLOW_SERIAL_CAPTURE
-                enterMode(Mode::CAPTURE);
+                startSerialCapture();
 #else
                 Serial.println();
                 Serial.println(
@@ -1229,12 +794,13 @@ void handleCommands()
 
             case 's':
             case 'S':
-                enterMode(Mode::IDLE);
+#if ALLOW_SERIAL_CAPTURE
+                stopSerialCapture();
+#endif
                 break;
 
             case '?':
-                if (mode != Mode::CAPTURE)
-                    printStatus();
+                printStatus();
                 break;
 
             default:
@@ -1256,9 +822,7 @@ void setup()
     delay(1000);
 
     Serial.println();
-    Serial.println(
-        "ESP32 + INMP441 multi-band FFT test"
-    );
+    Serial.println("ESP32 + INMP441 audio node");
 
     Serial.printf(
         "Sample rate: %u Hz\n",
@@ -1266,28 +830,12 @@ void setup()
     );
 
     Serial.printf(
-        "FFT samples: %u\n",
-        FFT_SAMPLES
-    );
-
-    Serial.printf(
-        "FFT resolution: %.3f Hz/bin\n",
-        static_cast<double>(SAMPLE_RATE) /
-            FFT_SAMPLES
-    );
-
-    Serial.printf(
-        "Capture duration: %.1f ms\n",
+        "Frame: %u samples (%.1f ms)\n",
+        FRAME_SAMPLES,
         (
-            static_cast<double>(FFT_SAMPLES) /
+            static_cast<double>(FRAME_SAMPLES) /
             SAMPLE_RATE
-        ) *
-            1000.0
-    );
-
-    Serial.printf(
-        "Nyquist frequency: %.0f Hz\n",
-        SAMPLE_RATE / 2.0
+        ) * 1000.0
     );
 
     initI2S();
@@ -1303,28 +851,24 @@ void setup()
         i++
     )
     {
-        captureAudio();
+        readSamples(FRAME_SAMPLES);
     }
 
     setupWifi();
     startAudioServer();
 
 #if ALLOW_SERIAL_CAPTURE
-    Serial.println(
-        "Commands: t=text  c=capture  s=stop  ?=status"
-    );
+    Serial.println("Commands: c=capture  s=stop  ?=status");
 #else
-    Serial.println(
-        "Commands: t=text  s=stop  ?=status"
-    );
-
-    Serial.println(
-        "Serial is text only. Audio streams over TCP; "
-        "connect a client to start it."
-    );
+    Serial.println("Commands: ?=status");
 #endif
 
-    Serial.println("Starting analysis.");
+    Serial.println(
+        "Serial reports status and connection state only. "
+        "Audio streams over TCP; all analysis is on the PC."
+    );
+
+    Serial.println("Ready.");
 }
 
 void loop()
@@ -1332,11 +876,6 @@ void loop()
     handleCommands();
     handleTcpClient();
 
-    // A TCP client outranks everything: it gets the PCM, and
-    // Serial stays a text channel. The periodic FFT dump is
-    // paused while that happens, because it needs 1024-sample
-    // reads and would fight the 512-sample frame cadence for
-    // the same I2S buffer.
     if (tcpClientStreaming())
     {
         if (!readPcmFrame())
@@ -1350,25 +889,24 @@ void loop()
         return;
     }
 
-    switch (mode)
+#if ALLOW_SERIAL_CAPTURE
+    if (serialCapture)
     {
-        case Mode::TEXT:
-            if (captureAudio())
-                processAudio();
-            break;
+        if (readPcmFrame())
+        {
+            StreamSink sink = serialSink();
 
-        case Mode::CAPTURE:
-            if (readPcmFrame())
-            {
-                StreamSink sink = serialSink();
-                sendFrame(sink, i2sSamples, FRAME_SAMPLES);
-            }
-            break;
+            if (!sendFrame(sink, i2sSamples, FRAME_SAMPLES))
+                stopSerialCapture();
+        }
 
-        case Mode::IDLE:
-            // Keep the DMA buffers drained so re-entering
-            // CAPTURE does not start on stale audio.
-            readSamples(FRAME_SAMPLES);
-            break;
+        return;
     }
+#endif
+
+    // Nobody is listening. Keep reading anyway so the DMA ring
+    // does not overflow and so a client that connects starts on
+    // fresh audio rather than whatever was left in the buffers.
+    drainI2sEvents();
+    readSamples(FRAME_SAMPLES);
 }

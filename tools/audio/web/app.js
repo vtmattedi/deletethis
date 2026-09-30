@@ -27,9 +27,49 @@ const SETTINGS = [
 ];
 
 const $ = (id) => document.getElementById(id);
+const PLAYBACK_GAIN_DB = 6;
+const PLAYBACK_GAIN = 10 ** (PLAYBACK_GAIN_DB / 20);
 
-let editing = null;   // don't fight the user while they type
 let lastEventCount = -1;
+let settingsDirty = false;
+let eventPage = 1;
+let eventPages = 0;
+const EVENT_PAGE_SIZE = 10;
+const selectedEventIds = new Set();
+let visibleEventIds = [];
+let audioPlaybackContext = null;
+const boostedAudio = new WeakMap();
+
+function enablePlaybackGain(audio) {
+  audio.title = `Playback boosted by +${PLAYBACK_GAIN_DB} dB; WAV unchanged`;
+  audio.addEventListener("play", async () => {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) return;
+
+    if (!audioPlaybackContext) audioPlaybackContext = new AudioContext();
+    if (!boostedAudio.has(audio)) {
+      const source = audioPlaybackContext.createMediaElementSource(audio);
+      const gain = audioPlaybackContext.createGain();
+      gain.gain.value = PLAYBACK_GAIN;
+      source.connect(gain).connect(audioPlaybackContext.destination);
+      boostedAudio.set(audio, { source, gain });
+    }
+    if (audioPlaybackContext.state === "suspended") {
+      await audioPlaybackContext.resume();
+    }
+  });
+}
+
+function releasePlaybackAudio(container) {
+  for (const audio of container.querySelectorAll("audio")) {
+    const nodes = boostedAudio.get(audio);
+    if (nodes) {
+      nodes.source.disconnect();
+      nodes.gain.disconnect();
+      boostedAudio.delete(audio);
+    }
+  }
+}
 
 function rows(table, pairs) {
   const body = table.tBodies[0];
@@ -71,54 +111,64 @@ function buildSettings(config) {
 
     input.id = "cfg-" + key;
     input.value = config[key];
-    input.addEventListener("focus", () => { editing = key; });
-    input.addEventListener("blur", () => {
-      if (editing === key) editing = null;
+    input.addEventListener("input", () => {
+      settingsDirty = true;
+      $("saveSettings").disabled = false;
+      $("saved").textContent = "Unsaved changes";
     });
-    input.addEventListener("change", () => send(key, input));
 
     wrap.append(input);
     form.append(wrap);
   }
 }
 
-async function send(key, input) {
-  const value = input.tagName === "SELECT"
-    ? input.value
-    : Number(input.value);
+async function saveSettings() {
+  const changes = {};
+  for (const [key, , kind] of SETTINGS) {
+    const input = $("cfg-" + key);
+    if (!input.value) {
+      $("saved").textContent = "Fill in every setting before saving";
+      return;
+    }
+    changes[key] = kind === "select" ? input.value : Number(input.value);
+  }
 
   const response = await fetch("/api/config", {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ [key]: value }),
+    body: JSON.stringify(changes),
   });
 
   const note = $("saved");
 
   if (!response.ok) {
-    note.textContent = `${key} rejected`;
+    note.textContent = "Settings rejected — check the entered values";
     return;
   }
 
   const config = await response.json();
   for (const [name] of SETTINGS) {
     const field = $("cfg-" + name);
-    if (field && name !== editing) field.value = config[name];
+    if (field) field.value = config[name];
   }
 
-  note.textContent =
-    `${key} = ${config[key]} — candidate history cleared, ` +
-    `the hold restarts`;
+  settingsDirty = false;
+  $("saveSettings").disabled = true;
+  note.textContent = "Saved — candidate history cleared; the hold restarted";
 }
 
 function applyConfig(config) {
   buildSettings(config);
 
-  for (const [name] of SETTINGS) {
-    const field = $("cfg-" + name);
-    if (field && name !== editing) field.value = config[name];
+  if (!settingsDirty) {
+    for (const [name] of SETTINGS) {
+      const field = $("cfg-" + name);
+      if (field) field.value = config[name];
+    }
   }
 }
+
+$("saveSettings").addEventListener("click", saveSettings);
 
 function render(data) {
   const state = data.state || "--";
@@ -163,17 +213,36 @@ function render(data) {
 }
 
 async function loadEvents() {
-  const response = await fetch("/api/events");
+  const params = new URLSearchParams({
+    page: eventPage,
+    pageSize: EVENT_PAGE_SIZE,
+    search: $("eventSearch").value.trim(),
+  });
+  const response = await fetch(`/api/events?${params}`);
   if (!response.ok) return;
 
-  const { events } = await response.json();
+  const data = await response.json();
+  const { events } = data;
+  if (data.pages && eventPage > data.pages) {
+    eventPage = data.pages;
+    return loadEvents();
+  }
+  eventPages = data.pages;
+  visibleEventIds = events.map((event) => event.id);
   const list = $("events");
+  releasePlaybackAudio(list);
   list.textContent = "";
+  $("eventCount").textContent = `${data.total} saved`;
+  $("eventPage").textContent = eventPages
+    ? `Page ${data.page} of ${eventPages}` : "No pages";
+  $("previousEvents").disabled = data.page <= 1;
+  $("nextEvents").disabled = data.page >= eventPages;
+  updateEventSelection();
 
   if (!events.length) {
     const item = document.createElement("li");
     item.className = "note";
-    item.textContent = "No transitions recorded yet.";
+    item.textContent = "No saved events match.";
     list.append(item);
     return;
   }
@@ -182,8 +251,19 @@ async function loadEvents() {
     const item = document.createElement("li");
     item.className = "event";
     item.addEventListener("click", (e) => {
-      if (e.target.tagName === "AUDIO") return;   // let controls work
+      if (e.target.closest("audio, button, input, label")) return;
       openEvent(event.id, item);
+    });
+
+    const select = document.createElement("input");
+    select.type = "checkbox";
+    select.className = "event-select";
+    select.checked = selectedEventIds.has(event.id);
+    select.setAttribute("aria-label", `Select event ${event.id}`);
+    select.addEventListener("change", () => {
+      if (select.checked) selectedEventIds.add(event.id);
+      else selectedEventIds.delete(event.id);
+      updateEventSelection();
     });
 
     const when = document.createElement("span");
@@ -193,9 +273,17 @@ async function loadEvents() {
     const what = document.createElement("strong");
     what.textContent = `${event.from || "--"} → ${event.to}`;
 
+    const review = document.createElement("span");
+    const correctness = event.review?.status === "reviewed"
+      ? (event.review.classificationCorrect ? "correct" : "incorrect")
+      : "unreviewed";
+    review.className = `review-status review-${correctness}`;
+    review.textContent = correctness;
+
     const held = document.createElement("span");
     held.className = "note";
     held.textContent =
+      `${event.source === "manual" ? "manual · " : ""}` +
       `held ${event.candidateHeldSeconds}s · ` +
       `${event.audio.seconds}s audio`;
 
@@ -203,11 +291,105 @@ async function loadEvents() {
     audio.controls = true;
     audio.preload = "none";
     audio.src = `/api/events/${event.id}/audio`;
+    enablePlaybackGain(audio);
 
-    item.append(when, what, held, audio);
+    item.append(select, when, what, review, held, audio);
     list.append(item);
   }
 }
+
+function updateEventSelection() {
+  const count = selectedEventIds.size;
+  $("selectionCount").textContent = `${count} selected`;
+  $("deleteSelectedEvents").disabled = count === 0;
+
+  const selectAll = $("selectAllEvents");
+  const visibleSelected = visibleEventIds.filter(
+    (identifier) => selectedEventIds.has(identifier),
+  ).length;
+  selectAll.checked = visibleEventIds.length > 0 &&
+    visibleSelected === visibleEventIds.length;
+  selectAll.indeterminate = visibleSelected > 0 &&
+    visibleSelected < visibleEventIds.length;
+  selectAll.disabled = visibleEventIds.length === 0;
+}
+
+async function deleteSelectedEvents() {
+  const identifiers = [...selectedEventIds];
+  if (!identifiers.length) return;
+  if (!confirm(
+    `Delete ${identifiers.length} selected event` +
+    `${identifiers.length === 1 ? "" : "s"} and their WAV files permanently?`,
+  )) return;
+
+  const button = $("deleteSelectedEvents");
+  button.disabled = true;
+  button.textContent = "Deleting…";
+  const response = await fetch("/api/events", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids: identifiers }),
+  });
+
+  if (!response.ok) {
+    button.textContent = "Delete failed — retry";
+    button.disabled = false;
+    return;
+  }
+
+  const result = await response.json();
+  for (const identifier of result.deleted) selectedEventIds.delete(identifier);
+  for (const identifier of result.notFound) selectedEventIds.delete(identifier);
+  button.textContent = "Delete selected";
+  $("detail").hidden = true;
+  await loadEvents();
+}
+
+$("selectAllEvents").addEventListener("change", (event) => {
+  for (const identifier of visibleEventIds) {
+    if (event.target.checked) selectedEventIds.add(identifier);
+    else selectedEventIds.delete(identifier);
+  }
+  for (const checkbox of document.querySelectorAll(".event-select")) {
+    checkbox.checked = event.target.checked;
+  }
+  updateEventSelection();
+});
+$("deleteSelectedEvents").addEventListener("click", deleteSelectedEvents);
+
+async function recordEvent() {
+  const button = $("recordEvent");
+  const note = $("recordNote");
+  button.disabled = true;
+  note.textContent = "Starting…";
+  const response = await fetch("/api/events/manual", { method: "POST" });
+  const result = await response.json();
+  button.disabled = false;
+  note.textContent = response.ok
+    ? `Recording ${result.id}; it will appear after the post-roll.`
+    : (result.detail || "Could not start recording");
+}
+
+$("recordEvent").addEventListener("click", recordEvent);
+$("eventSearchButton").addEventListener("click", () => {
+  eventPage = 1;
+  loadEvents();
+});
+$("eventSearch").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    eventPage = 1;
+    loadEvents();
+  }
+});
+$("previousEvents").addEventListener("click", () => {
+  if (eventPage > 1) eventPage -= 1;
+  loadEvents();
+});
+$("nextEvents").addEventListener("click", () => {
+  if (eventPage < eventPages) eventPage += 1;
+  loadEvents();
+});
 
 function connect() {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
@@ -241,9 +423,27 @@ async function loadHistory() {
 
   const note = $("historyNote");
   note.textContent = data.count
-    ? `${data.count} point${data.count === 1 ? "" : "s"}` +
-      (data.truncated ? " (truncated)" : "")
+    ? `${data.count} of ${data.total} point` +
+      (data.total === 1 ? "" : "s") +
+      (data.downsampled
+        ? ` · averaged over ${data.bucketSeconds}s buckets`
+        : "")
     : "nothing recorded in this range yet";
+
+  // Turn connect/disconnect events into [from, to] outage spans.
+  const outages = [];
+  let downAt = null;
+
+  for (const event of data.connection || []) {
+    if (!event.connected && downAt == null) {
+      downAt = Math.max(event.t, data.from);
+    } else if (event.connected && downAt != null) {
+      outages.push([downAt, event.t]);
+      downAt = null;
+    }
+  }
+
+  if (downAt != null) outages.push([downAt, null]);
 
   const column = { "30-80": "band_30_80", "500-1k": "band_500_1k",
                    "1k-2k": "band_1k_2k" };
@@ -260,6 +460,7 @@ async function loadHistory() {
     {
       height: 200,
       states: c.state || [],
+      outages,
       xFormat: (v) => new Date(v * 1000).toLocaleTimeString(),
       emptyText: "no history recorded in this range yet",
     },
@@ -287,6 +488,128 @@ function heading(text) {
   return h;
 }
 
+function buildReview(meta) {
+  const form = document.createElement("div");
+  form.className = "review-form";
+  form.append(heading("Review"));
+
+  let verdict = meta.review?.status === "reviewed"
+    ? meta.review.classificationCorrect : null;
+
+  const choices = document.createElement("div");
+  choices.className = "review-actions";
+  const correct = document.createElement("button");
+  const wrong = document.createElement("button");
+  correct.type = wrong.type = "button";
+  correct.textContent = "Correct";
+  wrong.textContent = "Wrong";
+  correct.className = "review-choice";
+  wrong.className = "review-choice";
+  choices.append(correct, wrong);
+  form.append(choices);
+
+  const stateSelect = (value) => {
+    const select = document.createElement("select");
+    const blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = "Select…";
+    select.append(blank);
+    for (const state of ["OFF", "FAN", "COMPRESSOR", "UNKNOWN"]) {
+      const option = document.createElement("option");
+      option.value = option.textContent = state;
+      select.append(option);
+    }
+    select.value = value || "";
+    return select;
+  };
+
+  const actualFrom = stateSelect(meta.review?.actualFrom);
+  const actualTo = stateSelect(meta.review?.actualTo);
+  const field = (label, control) => {
+    const wrapper = document.createElement("label");
+    const name = document.createElement("span");
+    name.textContent = label;
+    wrapper.append(name, control);
+    form.append(wrapper);
+  };
+  field("Actual from", actualFrom);
+  field("Actual to", actualTo);
+
+  const tags = document.createElement("div");
+  tags.className = "review-tags";
+  const selected = new Set(meta.review?.interference || []);
+  for (const tag of ["talking", "printer", "tv", "other"]) {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = tag;
+    input.checked = selected.has(tag);
+    const text = document.createElement("span");
+    text.textContent = tag;
+    label.append(input, text);
+    tags.append(label);
+  }
+  field("Interference", tags);
+
+  const notes = document.createElement("textarea");
+  notes.value = meta.review?.notes || "";
+  notes.placeholder = "Optional notes";
+  field("Notes", notes);
+
+  const save = document.createElement("button");
+  save.type = "button";
+  save.textContent = "Save review";
+  const message = document.createElement("span");
+  message.className = "note";
+  const footer = document.createElement("div");
+  footer.className = "review-actions";
+  footer.append(save, message);
+  form.append(footer);
+
+  const showVerdict = () => {
+    correct.classList.toggle("active", verdict === true);
+    wrong.classList.toggle("active", verdict === false);
+  };
+  correct.addEventListener("click", () => {
+    verdict = true;
+    actualFrom.value = meta.from || "UNKNOWN";
+    actualTo.value = meta.to || "UNKNOWN";
+    showVerdict();
+  });
+  wrong.addEventListener("click", () => {
+    verdict = false;
+    showVerdict();
+  });
+  showVerdict();
+
+  save.addEventListener("click", async () => {
+    if (verdict === null || !actualFrom.value || !actualTo.value) {
+      message.textContent = "Choose Correct/Wrong and both actual states.";
+      return;
+    }
+    save.disabled = true;
+    message.textContent = "Saving…";
+    const interference = [...tags.querySelectorAll("input:checked")]
+      .map((input) => input.value);
+    const response = await fetch(`/api/events/${meta.id}/review`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        classificationCorrect: verdict,
+        actualFrom: actualFrom.value,
+        actualTo: actualTo.value,
+        interference,
+        notes: notes.value,
+      }),
+    });
+    save.disabled = false;
+    message.textContent = response.ok ? "Review saved." : "Review could not be saved.";
+    if (response.ok) loadEvents();
+  });
+
+  return form;
+}
+
 async function openEvent(id, item) {
   for (const other of document.querySelectorAll("li.event.open")) {
     other.classList.remove("open");
@@ -296,6 +619,7 @@ async function openEvent(id, item) {
   const panel = $("detail");
   const body = $("detailBody");
   panel.hidden = false;
+  releasePlaybackAudio(body);
   body.textContent = "loading…";
   panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
 
@@ -356,7 +680,33 @@ async function openEvent(id, item) {
   audio.src = `/api/events/${id}/audio`;
   audio.style.width = "100%";
   audio.style.marginTop = "14px";
+  enablePlaybackGain(audio);
   body.append(audio);
+
+  body.append(buildReview(meta));
+
+  const detailActions = document.createElement("div");
+  detailActions.className = "detail-actions";
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "danger";
+  remove.textContent = "Delete event";
+  remove.addEventListener("click", async () => {
+    if (!confirm("Delete this event's JSON and WAV permanently?")) return;
+    remove.disabled = true;
+    const response = await fetch(`/api/events/${meta.id}`, { method: "DELETE" });
+    if (!response.ok) {
+      remove.disabled = false;
+      remove.textContent = "Delete failed";
+      return;
+    }
+    panel.hidden = true;
+    selectedEventIds.delete(meta.id);
+    if (eventPage > 1 && $("events").children.length === 1) eventPage -= 1;
+    loadEvents();
+  });
+  detailActions.append(remove);
+  body.append(detailActions);
 
   body.append(heading("feature timeline, recomputed from the audio"));
 
