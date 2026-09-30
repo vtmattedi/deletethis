@@ -47,7 +47,12 @@ from scipy.signal import spectrogram
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_RECORDINGS = HERE / "recordings"
-DEFAULT_PLOTDIR = HERE / "plots"
+
+# Everything generated lands under results/, which is gitignored apart
+# from its .gitkeep. Recordings are inputs and live separately.
+DEFAULT_RESULTS = HERE / "results"
+DEFAULT_PLOTDIR = DEFAULT_RESULTS / "plots"
+DEFAULT_FEATURES_CSV = DEFAULT_RESULTS / "features.csv"
 
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_NFFT = 1024
@@ -1419,17 +1424,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PLOTDIR,
         help=(
             "Plot output directory "
-            "(default: tools/audio/plots)"
+            "(default: tools/audio/results/plots)"
         ),
     )
 
     parser.add_argument(
         "--csv",
         type=Path,
+        nargs="?",
+        const=DEFAULT_FEATURES_CSV,
         default=None,
         help=(
             "Write per-window features "
-            "to CSV"
+            "to CSV; bare --csv writes "
+            "tools/audio/results/features.csv"
         ),
     )
 

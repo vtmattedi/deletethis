@@ -30,8 +30,12 @@ a rolling median, and the resulting candidate must hold for a couple of
 seconds before it becomes the reported state. That is what stops a door
 slam or a printer from being read as a compressor.
 
-The default thresholds are exploratory starting points, not measured
-values. Record OFF / FAN / COMPRESSOR, run analyze.py, and replace them.
+The defaults were tuned with ``--replay`` against 18 labelled
+recordings and reach 99.3% of decided windows, 17/18 files perfect.
+COMPRESSOR is exact in all 6 files including speech. The one remaining
+error is OFF with talking being called FAN for part of one recording:
+speech puts real energy in both fan bands, and level alone cannot
+always tell a fan from a voice. Re-run --replay after any rule change.
 """
 
 from __future__ import annotations
@@ -45,6 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from scipy.io import wavfile
 from scipy.signal import get_window
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -59,7 +64,12 @@ from acstream import (  # noqa: E402
 from analyze import (  # noqa: E402
     BANDS,
     DB_FLOOR,
+    DEFAULT_RECORDINGS,
+    DEFAULT_RESULTS,
+    format_table,
+    infer_labels,
     power_to_db,
+    to_float,
 )
 
 # The states this classifier can report, in escalation order.
@@ -77,10 +87,22 @@ DIAGNOSTIC_BANDS = ["200-1200"]
 DEFAULT_NFFT = 1024
 DEFAULT_OVERLAP = 0.5
 
-# Exploratory starting points. See the module docstring.
+# Measured against the 18 labelled recordings with --replay. See the
+# module docstring for what the numbers are worth and where they fail.
+#
+# COMPRESSOR has an enormous margin: 30-80 sits at -38 dB when the
+# compressor runs and at -57..-59 dB in every other condition, so -48
+# is 10 dB clear of both sides.
+#
+# FAN is far tighter. The fan's own 1k-2k level is about -63.7 dB, and
+# speech with the AC off reaches -58 dB in peaks, so the usable window
+# for the high threshold is only -66..-64 and -65 is its centre. Both
+# fan bands must be over threshold, which is what separates a fan from
+# someone talking; either-of-two cannot get past 93%.
 DEFAULT_COMPRESSOR_THRESHOLD = -48.0
-DEFAULT_FAN_MID_THRESHOLD = -63.0
-DEFAULT_FAN_HIGH_THRESHOLD = -68.0
+DEFAULT_FAN_MID_THRESHOLD = -62.0
+DEFAULT_FAN_HIGH_THRESHOLD = -65.0
+DEFAULT_FAN_REQUIRE = "both"
 
 DEFAULT_HOLD_SECONDS = 2.0
 DEFAULT_MEDIAN_SECONDS = 0.5
@@ -169,6 +191,25 @@ class FeatureExtractor:
 
         self.buffer = np.zeros(0, dtype=np.float64)
         self.samples_seen = 0
+
+    def reset(self, skip_samples: int = 0) -> None:
+        """Drop the partial window after a gap in the audio.
+
+        Without this, the samples either side of a lost frame are
+        concatenated and the next window straddles the gap: a window
+        of audio that was never contiguous, with a step discontinuity
+        in the middle that smears energy across the whole spectrum.
+        That one bad window is enough to move a band level by tens of
+        dB, so it must not reach the classifier at all.
+
+        ``skip_samples`` advances the time axis over the gap so that
+        stability timings stay in real time. The samples still sitting
+        in the buffer are counted too: they were received but will
+        never be emitted as a window, and leaving them out would make
+        the clock lag further behind on every dropout.
+        """
+        self.samples_seen += self.buffer.size + skip_samples
+        self.buffer = np.zeros(0, dtype=np.float64)
 
     def push(self, samples: np.ndarray) -> list[Features]:
         """Add a frame, return every window it completes."""
@@ -309,6 +350,18 @@ class Smoother:
         self.candidate_since = 0.0
         self.state: str | None = None
 
+    def reset(self) -> None:
+        """Forget the feature history after a gap in the audio.
+
+        The published state is kept: it is the last thing actually
+        observed, and a dropout is not evidence that it changed. But
+        the candidate has to re-earn its hold, so nothing is published
+        on the strength of medians taken across a discontinuity.
+        """
+        self.history.clear()
+        self.candidate = None
+        self.candidate_since = 0.0
+
     def update(self, features: Features) -> Decision:
         self.history.append(features)
 
@@ -439,11 +492,362 @@ class Display:
         )
         self.out.flush()
 
+    def gap(self, frames: int, frame_seconds: float) -> None:
+        stamp = time.strftime("%H:%M:%S")
+
+        if self.interactive:
+            self.out.write("\r" + " " * self.line_length + "\r")
+            self.line_length = 0
+
+        self.out.write(
+            f"{stamp}  gap: {frames} frame(s), "
+            f"{frames * frame_seconds * 1000:.0f} ms missing; "
+            "history reset\n"
+        )
+        self.out.flush()
+
     def finish(self) -> None:
         if self.interactive and self.line_length:
             self.out.write("\n")
             self.out.flush()
             self.line_length = 0
+
+
+# ---------------------------------------------------------------------
+# Offline replay
+#
+# Runs the live classifier -- the same FeatureExtractor, the same
+# Smoother, the same classify() -- over recorded WAV files, so a rule
+# change can be judged against 18 labelled recordings in a second
+# instead of by standing in front of the air conditioner.
+#
+# Nothing here is a second implementation of the rules. If this
+# disagrees with the live path, that is a bug in this file.
+# ---------------------------------------------------------------------
+
+
+UNDECIDED = "--"
+
+
+@dataclass
+class ReplayResult:
+    path: Path
+    expected: str
+    interference: str
+
+    predictions: list[str | None]
+    window_rate: float
+
+    @property
+    def decided(self) -> list[str]:
+        return [p for p in self.predictions if p is not None]
+
+    @property
+    def warmup_seconds(self) -> float:
+        for index, prediction in enumerate(self.predictions):
+            if prediction is not None:
+                return index / self.window_rate
+
+        return len(self.predictions) / self.window_rate
+
+    @property
+    def accuracy(self) -> float:
+        decided = self.decided
+
+        if not decided:
+            return 0.0
+
+        return sum(
+            1 for p in decided if p == self.expected
+        ) / len(decided)
+
+    @property
+    def classified(self) -> str:
+        decided = self.decided
+
+        if not decided:
+            return UNDECIDED
+
+        return max(set(decided), key=decided.count)
+
+
+def replay_file(
+    path: Path,
+    args: argparse.Namespace,
+    thresholds: Thresholds,
+    frame_samples: int = 512,
+) -> ReplayResult:
+    sample_rate, raw = wavfile.read(path)
+
+    # to_float normalises to [-1, 1); the extractor expects raw counts
+    # and divides by FULL_SCALE itself, so put it back in that domain.
+    signal = to_float(raw) * FULL_SCALE
+
+    extractor = FeatureExtractor(
+        sample_rate,
+        args.nfft,
+        args.overlap,
+    )
+
+    window_rate = sample_rate / extractor.hop
+
+    smoother = Smoother(
+        thresholds,
+        window_rate=window_rate,
+        median_seconds=args.median_seconds,
+        hold_seconds=args.hold_seconds,
+    )
+
+    predictions: list[str | None] = []
+
+    # Fed in frames the size the ESP32 actually sends, so the window
+    # boundaries land exactly where they would live.
+    for start in range(0, signal.size - frame_samples + 1, frame_samples):
+        chunk = signal[start : start + frame_samples]
+
+        for features in extractor.push(chunk):
+            predictions.append(smoother.update(features).state)
+
+    labels = infer_labels(path)
+
+    return ReplayResult(
+        path=path,
+        expected=labels.state.upper(),
+        interference=labels.interference,
+        predictions=predictions,
+        window_rate=window_rate,
+    )
+
+
+def replay_table(results: list[ReplayResult]) -> str:
+    rows = []
+
+    for result in results:
+        rows.append(
+            [
+                result.path.stem,
+                result.expected,
+                result.classified,
+                f"{result.accuracy:.0%}",
+                f"{len(result.decided)}",
+                f"{result.warmup_seconds:.1f}",
+            ]
+        )
+
+    return format_table(
+        rows,
+        ["File", "expected", "classified", "accuracy", "windows", "warmup s"],
+    )
+
+
+def confusion_matrix(results: list[ReplayResult]) -> str:
+    states = [OFF, FAN, COMPRESSOR]
+
+    counts = {
+        actual: {predicted: 0 for predicted in states}
+        for actual in states
+    }
+
+    for result in results:
+        if result.expected not in counts:
+            continue
+
+        for prediction in result.decided:
+            if prediction in counts[result.expected]:
+                counts[result.expected][prediction] += 1
+
+    rows = []
+
+    for actual in states:
+        total = sum(counts[actual].values())
+
+        row = [f"actual {actual}"]
+
+        for predicted in states:
+            count = counts[actual][predicted]
+
+            row.append(
+                f"{count}"
+                if not total
+                else f"{count} ({count / total:.0%})"
+            )
+
+        rows.append(row)
+
+    return format_table(
+        rows,
+        ["", f"pred {OFF}", f"pred {FAN}", f"pred {COMPRESSOR}"],
+    )
+
+
+def condition_table(results: list[ReplayResult]) -> str:
+    grouped: dict[tuple[str, str], list[ReplayResult]] = {}
+
+    for result in results:
+        grouped.setdefault(
+            (result.expected, result.interference), []
+        ).append(result)
+
+    rows = []
+
+    for (expected, interference), group in sorted(grouped.items()):
+        decided = [p for r in group for p in r.decided]
+
+        correct = sum(1 for p in decided if p == expected)
+
+        predictions = {p for p in decided}
+
+        rows.append(
+            [
+                f"{expected} / {interference}",
+                str(len(group)),
+                f"{correct / len(decided):.0%}" if decided else "-",
+                ", ".join(sorted(predictions)) or "-",
+            ]
+        )
+
+    return format_table(
+        rows,
+        ["Condition", "files", "accuracy", "predicted"],
+    )
+
+
+def write_replay_csv(path: Path, results: list[ReplayResult]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+
+        writer.writerow(
+            ["file", "expected", "interference", "t", "predicted"]
+        )
+
+        for result in results:
+            for index, prediction in enumerate(result.predictions):
+                writer.writerow(
+                    [
+                        result.path.stem,
+                        result.expected,
+                        result.interference,
+                        f"{index / result.window_rate:.3f}",
+                        prediction or "",
+                    ]
+                )
+
+
+def run_replay(args: argparse.Namespace) -> int:
+    paths: list[Path] = []
+
+    for entry in args.replay or [DEFAULT_RECORDINGS]:
+        entry = Path(entry)
+
+        if entry.is_dir():
+            paths.extend(sorted(entry.glob("*.wav")))
+        else:
+            paths.append(entry)
+
+    if not paths:
+        print(
+            f"No recordings found in {DEFAULT_RECORDINGS}.",
+            file=sys.stderr,
+        )
+        return 1
+
+    thresholds = Thresholds(
+        compressor=args.compressor_threshold,
+        fan_mid=args.fan_mid_threshold,
+        fan_high=args.fan_high_threshold,
+        fan_require_both=args.fan_require == "both",
+    )
+
+    results: list[ReplayResult] = []
+
+    for path in paths:
+        if not path.exists():
+            print(f"warning: {path} does not exist", file=sys.stderr)
+            continue
+
+        try:
+            results.append(replay_file(path, args, thresholds))
+        except (ValueError, OSError) as error:
+            print(f"warning: {path.name}: {error}", file=sys.stderr)
+
+    if not results:
+        print("error: nothing could be replayed", file=sys.stderr)
+        return 1
+
+    unknown = [r for r in results if r.expected == "UNKNOWN"]
+
+    print()
+    print(
+        f"Replaying the live classifier over {len(results)} recording(s)"
+    )
+    print()
+    print(
+        f"Rules:  COMPRESSOR if 30-80 >= "
+        f"{args.compressor_threshold:g}"
+    )
+    print(
+        f"        FAN if 500-1k >= {args.fan_mid_threshold:g} "
+        f"{'and' if args.fan_require == 'both' else 'or'} "
+        f"1k-2k >= {args.fan_high_threshold:g}"
+    )
+    print(
+        f"Smooth: {args.median_seconds:g}s median, "
+        f"{args.hold_seconds:g}s hold"
+    )
+
+    print()
+    print("Per file")
+    print()
+    print(replay_table(results))
+
+    print()
+    print("Confusion matrix, over decided windows")
+    print()
+    print(confusion_matrix(results))
+
+    print()
+    print("By condition")
+    print()
+    print(condition_table(results))
+
+    scored = [r for r in results if r.expected != "UNKNOWN"]
+
+    if scored:
+        decided = [p for r in scored for p in r.decided]
+        correct = sum(
+            1
+            for r in scored
+            for p in r.decided
+            if p == r.expected
+        )
+
+        perfect = sum(1 for r in scored if r.accuracy >= 0.999)
+
+        print()
+        print(
+            f"Overall: {correct / len(decided):.1%} of "
+            f"{len(decided)} decided windows; "
+            f"{perfect}/{len(scored)} files classified perfectly"
+        )
+
+    if unknown:
+        print()
+        print(
+            f"Note: {len(unknown)} file(s) have no recognised state in "
+            "the name and are listed but not scored: "
+            + ", ".join(r.path.stem for r in unknown)
+        )
+
+    if args.replay_csv:
+        write_replay_csv(args.replay_csv, results)
+        print()
+        print(f"Wrote {args.replay_csv}")
+
+    print()
+
+    return 0
 
 
 # ---------------------------------------------------------------------
@@ -470,6 +874,31 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_BAUD,
         help=f"Serial baud rate (default: {DEFAULT_BAUD})",
+    )
+
+    parser.add_argument(
+        "--replay",
+        nargs="*",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Offline mode: run this exact classifier over recorded "
+            "WAV files instead of the serial port, and report "
+            "per-file accuracy and a confusion matrix. Bare --replay "
+            "uses tools/audio/recordings"
+        ),
+    )
+
+    parser.add_argument(
+        "--replay-csv",
+        type=Path,
+        nargs="?",
+        const=DEFAULT_RESULTS / "replay.csv",
+        default=None,
+        help=(
+            "Write the per-window replay verdicts to CSV; bare flag "
+            "writes tools/audio/results/replay.csv"
+        ),
     )
 
     parser.add_argument(
@@ -521,10 +950,13 @@ def build_parser() -> argparse.ArgumentParser:
     thresholds.add_argument(
         "--fan-require",
         choices=["either", "both"],
-        default="either",
+        default=DEFAULT_FAN_REQUIRE,
         help=(
             "Whether one or both fan bands must be over threshold "
-            "(default: either)"
+            # argparse runs help text through %-expansion, so a literal
+            # per cent sign has to be doubled.
+            f"(default: {DEFAULT_FAN_REQUIRE}; 'either' cannot get "
+            "past 93%% on the recorded data)"
         ),
     )
 
@@ -571,8 +1003,13 @@ def build_parser() -> argparse.ArgumentParser:
     output.add_argument(
         "--log",
         type=Path,
+        nargs="?",
+        const=DEFAULT_RESULTS / "live.csv",
         default=None,
-        help="Append per-window features and state to this CSV",
+        help=(
+            "Write per-window features and state to CSV; bare --log "
+            "writes tools/audio/results/live.csv"
+        ),
     )
 
     output.add_argument(
@@ -675,8 +1112,27 @@ def run(args: argparse.Namespace) -> int:
     time_in_state: dict[str, float] = {}
     last_time: float | None = None
 
+    # Frames the host never received plus frames the device could not
+    # read. Either way there is a hole in the audio.
+    missing = stream.lost_frames + stream.dropped_frames
+    gaps = 0
+
     try:
         for frame in stream.frames():
+            now_missing = stream.lost_frames + stream.dropped_frames
+
+            if now_missing > missing:
+                lost = now_missing - missing
+                missing = now_missing
+                gaps += 1
+
+                extractor.reset(
+                    skip_samples=lost * info.frame_samples
+                )
+                smoother.reset()
+
+                display.gap(lost, info.frame_samples / info.sample_rate)
+
             for features in extractor.push(frame.samples):
                 previous = smoother.state
                 decision = smoother.update(features)
@@ -763,8 +1219,14 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(ports) if ports else "No serial ports found.")
         return 0
 
-    if not args.port:
-        parser.error("a serial port is required (or use --list-ports)")
+    if args.replay is None and not args.port:
+        parser.error(
+            "a serial port is required "
+            "(or use --replay for offline evaluation, or --list-ports)"
+        )
+
+    if args.replay is not None and args.port:
+        parser.error("--replay reads files, so it takes no serial port")
 
     if args.nfft < 64 or args.nfft & (args.nfft - 1):
         parser.error("--nfft must be a power of two and at least 64")
@@ -777,6 +1239,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.median_seconds <= 0.0:
         parser.error("--median-seconds must be positive")
+
+    if args.replay is not None:
+        return run_replay(args)
 
     return run(args)
 
