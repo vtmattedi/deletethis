@@ -1,0 +1,33 @@
+{
+    "cmake.sourceDirectory": "D:/Projects/PIO/Screen1/screen1/lib/lvgl",
+    "files.associations": {
+        "cmath": "cpp",
+        "random": "cpp",
+        "atomic": "cpp",
+        "string": "cpp",
+        "functional": "cpp",
+        "istream": "cpp",
+        "ostream": "cpp",
+        "array": "cpp",
+        "tuple": "cpp",
+        "type_traits": "cpp",
+        "utility": "cpp",
+        "optional": "cpp",
+        "system_error": "cpp",
+        "deque": "cpp",
+        "unordered_map": "cpp",
+        "unordered_set": "cpp",
+        "vector": "cpp",
+        "string_view": "cpp",
+        "initializer_list": "cpp",
+        "*.tcc": "cpp",
+        "numeric": "cpp",
+        "night.c": "cpp",
+        "day.c": "cpp",
+        "thunder_d.c": "cpp",
+        "thunder.c": "cpp",
+        "cloudy.c": "cpp",
+        "day_d.c": "cpp",
+        "day_alp.c": "cpp"
+    }
+}

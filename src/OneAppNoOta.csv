@@ -1,0 +1,7 @@
+# 4MB flash, single app slot, no OTA.
+# App partitions must start on a 0x10000 boundary, so the app begins at 0x10000.
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x5000,
+factory,  app,  factory, 0x10000,  0x3C0000,
+spiffs,   data, spiffs,  0x3D0000, 0x20000,
+coredump, data, coredump,0x3F0000, 0x10000,
