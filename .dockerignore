@@ -1,0 +1,22 @@
+.git
+.gitignore
+.pio
+.pioenvs
+.piolibdeps
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.wav
+
+# Runtime data is mounted from the host and must not be baked into an image.
+tools/audio/results
+tools/audio/recordings
+
+# Firmware and editor output are unrelated to the Python image.
+.vscode
+.idea
+compile_commands.json
+managed_components

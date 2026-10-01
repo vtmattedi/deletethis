@@ -18,6 +18,33 @@ pip install -r tools/audio/requirements.txt
 `fastapi` and `uvicorn` are only needed for `backend/`; the
 command-line tools work without them.
 
+### Docker Compose
+
+From the repository root, stop any native backend process first, then run:
+
+```sh
+docker compose up --build -d
+docker compose logs -f audio-backend
+```
+
+Open <http://localhost:8000>. The Compose defaults target the ESP32 at
+`10.10.3.17:3333`. To change the stream address, published web port, or
+timezone, copy `.env.example` to `.env` and edit its values before starting.
+
+Compose bind-mounts the existing host directory
+`tools/audio/results` at the identical location inside the image. The current
+`audio.db` (including its WAL files), `config.json`, event JSON metadata, and
+event WAV files therefore remain in place and survive image rebuilds and
+container removal. `docker compose down` does not remove them.
+
+Do not run the native backend and Compose service together. The ESP32 permits
+one audio client, and the history database should have only one application
+writer. Stop the container cleanly with:
+
+```sh
+docker compose down
+```
+
 The firmware must be the one in `src/main.cpp`. Copy the credentials
 template before the first build, or the compile stops with a message
 saying so:
