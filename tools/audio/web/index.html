@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>INMP441 Live</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=20260930-5">
 </head>
 <body>
 <header>
@@ -22,13 +22,24 @@
   </section>
 
   <section class="card">
-    <h2>Features</h2>
+    <div class="head">
+      <h2>Features</h2>
+      <button id="toggleFeatures" type="button" aria-expanded="false">
+        Show all
+      </button>
+    </div>
     <table id="features"><tbody></tbody></table>
   </section>
 
   <section class="card">
-    <h2>Stream</h2>
+    <div class="head">
+      <h2>Stream</h2>
+      <button id="toggleLiveAudio" type="button" aria-pressed="false">
+        Listen live
+      </button>
+    </div>
     <table id="stream"><tbody></tbody></table>
+    <p id="liveAudioNote" class="note">Headphones recommended.</p>
   </section>
 
   <section class="card">
@@ -58,12 +69,17 @@
     <div class="head">
       <h2>Events</h2>
       <button id="recordEvent" type="button">Record event now</button>
+      <label class="playback-gain">
+        <span>Playback gain</span>
+        <input id="playbackGain" type="range" min="0" max="18" step="1" value="6">
+        <output id="playbackGainValue" for="playbackGain">+6 dB</output>
+      </label>
       <span id="recordNote" class="note"></span>
     </div>
     <p class="note">
       Written on a published state change: 15 s before and after,
       raw PCM, with the decision that caused it. Browser playback is
-      boosted by +6 dB; stored WAV files are unchanged.
+      boosted by the selected gain; stored WAV files are unchanged.
     </p>
     <div class="event-tools">
       <input id="eventSearch" type="search" placeholder="Search events and reviews">
@@ -97,6 +113,6 @@
   </section>
 </main>
 
-<script type="module" src="app.js"></script>
+<script type="module" src="app.js?v=20260930-6"></script>
 </body>
 </html>

@@ -3,7 +3,8 @@
 
 import { lineChart, legend } from "./charts.js";
 
-const FEATURES = [
+const CORE_FEATURES = ["rms", "30-80", "500-1k", "1k-2k", "200-1200"];
+const ALL_FEATURES = [
   "rms", "30-80", "80-200", "200-500", "500-1k", "1k-2k",
   "2k-4k", "200-1200", "1500-4000", "peak_hz",
   "spectral_centroid", "spectral_flatness", "spectral_crest",
@@ -37,8 +38,7 @@ const SETTINGS = [
 ];
 
 const $ = (id) => document.getElementById(id);
-const PLAYBACK_GAIN_DB = 6;
-const PLAYBACK_GAIN = 10 ** (PLAYBACK_GAIN_DB / 20);
+const DEFAULT_PLAYBACK_GAIN_DB = 6;
 
 let lastEventCount = -1;
 let settingsDirty = false;
@@ -49,9 +49,29 @@ const selectedEventIds = new Set();
 let visibleEventIds = [];
 let audioPlaybackContext = null;
 const boostedAudio = new WeakMap();
+const activePlaybackGains = new Set();
+let playbackGainDb = DEFAULT_PLAYBACK_GAIN_DB;
+let showAllFeatures = false;
+let lastFeatures = {};
+let liveAudioSocket = null;
+let liveAudioGain = null;
+let liveAudioSampleRate = 0;
+let nextLiveAudioTime = 0;
+const liveAudioSources = new Set();
+
+try {
+  showAllFeatures = localStorage.getItem("showAllFeatures") === "true";
+  const savedGainText = localStorage.getItem("playbackGainDb");
+  const savedGain = Number(savedGainText);
+  if (savedGainText !== null && Number.isFinite(savedGain)) {
+    playbackGainDb = Math.max(0, Math.min(18, savedGain));
+  }
+} catch (_) {
+  // Storage can be disabled; the toggle still works for this page load.
+}
 
 function enablePlaybackGain(audio) {
-  audio.title = `Playback boosted by +${PLAYBACK_GAIN_DB} dB; WAV unchanged`;
+  audio.title = `Playback gain +${playbackGainDb} dB; WAV unchanged`;
   audio.addEventListener("play", async () => {
     const AudioContext = window.AudioContext || window.webkitAudioContext;
     if (!AudioContext) return;
@@ -60,9 +80,10 @@ function enablePlaybackGain(audio) {
     if (!boostedAudio.has(audio)) {
       const source = audioPlaybackContext.createMediaElementSource(audio);
       const gain = audioPlaybackContext.createGain();
-      gain.gain.value = PLAYBACK_GAIN;
+      gain.gain.value = 10 ** (playbackGainDb / 20);
       source.connect(gain).connect(audioPlaybackContext.destination);
       boostedAudio.set(audio, { source, gain });
+      activePlaybackGains.add(gain);
     }
     if (audioPlaybackContext.state === "suspended") {
       await audioPlaybackContext.resume();
@@ -76,10 +97,147 @@ function releasePlaybackAudio(container) {
     if (nodes) {
       nodes.source.disconnect();
       nodes.gain.disconnect();
+      activePlaybackGains.delete(nodes.gain);
       boostedAudio.delete(audio);
     }
   }
 }
+
+function setPlaybackGain(value) {
+  const numeric = Number(value);
+  playbackGainDb = Number.isFinite(numeric)
+    ? Math.max(0, Math.min(18, numeric))
+    : DEFAULT_PLAYBACK_GAIN_DB;
+  $("playbackGain").value = playbackGainDb;
+  $("playbackGainValue").textContent = `+${playbackGainDb} dB`;
+  for (const gain of activePlaybackGains) {
+    gain.gain.value = 10 ** (playbackGainDb / 20);
+  }
+  for (const audio of document.querySelectorAll("audio")) {
+    audio.title = `Playback gain +${playbackGainDb} dB; WAV unchanged`;
+  }
+  try {
+    localStorage.setItem("playbackGainDb", String(playbackGainDb));
+  } catch (_) {
+    // Keep the preference for this page when storage is disabled.
+  }
+}
+
+$("playbackGain").addEventListener("input", (event) => {
+  setPlaybackGain(event.target.value);
+});
+setPlaybackGain(playbackGainDb);
+
+function stopLiveAudio(message = "Live listening stopped.") {
+  const socket = liveAudioSocket;
+  liveAudioSocket = null;
+  if (socket && socket.readyState < WebSocket.CLOSING) {
+    try { socket.close(); } catch (_) { /* Already closing. */ }
+  }
+
+  for (const source of liveAudioSources) {
+    source.onended = null;
+    try { source.stop(); } catch (_) { /* Source already ended. */ }
+    source.disconnect();
+  }
+  liveAudioSources.clear();
+  if (liveAudioGain) {
+    activePlaybackGains.delete(liveAudioGain);
+    liveAudioGain.disconnect();
+    liveAudioGain = null;
+  }
+  liveAudioSampleRate = 0;
+  nextLiveAudioTime = 0;
+
+  const button = $("toggleLiveAudio");
+  button.textContent = "Listen live";
+  button.classList.remove("listening");
+  button.setAttribute("aria-pressed", "false");
+  $("liveAudioNote").textContent = message;
+}
+
+function scheduleLiveAudio(packet) {
+  if (!audioPlaybackContext || !liveAudioGain || !liveAudioSampleRate) return;
+
+  const pcm = new Int32Array(packet);
+  const buffer = audioPlaybackContext.createBuffer(
+    1, pcm.length, liveAudioSampleRate,
+  );
+  const channel = buffer.getChannelData(0);
+  for (let index = 0; index < pcm.length; index += 1) {
+    channel[index] = Math.max(-1, Math.min(1, pcm[index] / 8388608));
+  }
+
+  const now = audioPlaybackContext.currentTime;
+  if (nextLiveAudioTime < now + 0.04 || nextLiveAudioTime > now + 0.5) {
+    nextLiveAudioTime = now + 0.08;
+  }
+  const source = audioPlaybackContext.createBufferSource();
+  source.buffer = buffer;
+  source.connect(liveAudioGain);
+  source.onended = () => {
+    source.disconnect();
+    liveAudioSources.delete(source);
+  };
+  liveAudioSources.add(source);
+  source.start(nextLiveAudioTime);
+  nextLiveAudioTime += buffer.duration;
+}
+
+async function startLiveAudio() {
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContext) {
+    $("liveAudioNote").textContent = "Live audio is unsupported in this browser.";
+    return;
+  }
+
+  if (!audioPlaybackContext) audioPlaybackContext = new AudioContext();
+  await audioPlaybackContext.resume();
+  liveAudioGain = audioPlaybackContext.createGain();
+  liveAudioGain.gain.value = 10 ** (playbackGainDb / 20);
+  liveAudioGain.connect(audioPlaybackContext.destination);
+  activePlaybackGains.add(liveAudioGain);
+
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${scheme}://${location.host}/ws/audio`);
+  socket.binaryType = "arraybuffer";
+  liveAudioSocket = socket;
+
+  const button = $("toggleLiveAudio");
+  button.textContent = "Stop listening";
+  button.classList.add("listening");
+  button.setAttribute("aria-pressed", "true");
+  $("liveAudioNote").textContent = "Connecting live audio…";
+
+  socket.onmessage = (event) => {
+    if (typeof event.data === "string") {
+      const message = JSON.parse(event.data);
+      if (message.type === "format") {
+        liveAudioSampleRate = message.sampleRate;
+        nextLiveAudioTime = 0;
+        $("liveAudioNote").textContent =
+          `Listening live at ${message.sampleRate} Hz · headphones recommended.`;
+      } else if (message.type === "status" && !message.connected) {
+        $("liveAudioNote").textContent = "Waiting for the audio stream…";
+      }
+      return;
+    }
+    scheduleLiveAudio(event.data);
+  };
+  socket.onclose = () => {
+    if (liveAudioSocket === socket) {
+      stopLiveAudio("Live audio disconnected.");
+    }
+  };
+  socket.onerror = () => {
+    $("liveAudioNote").textContent = "Live audio connection failed.";
+  };
+}
+
+$("toggleLiveAudio").addEventListener("click", () => {
+  if (liveAudioSocket) stopLiveAudio();
+  else startLiveAudio();
+});
 
 function rows(table, pairs) {
   const body = table.tBodies[0];
@@ -102,6 +260,34 @@ function formatFeatureValue(name, value) {
   if (name.startsWith("spectral_")) return value.toFixed(4);
   return value.toFixed(2) + " dB";
 }
+
+function updateFeatureToggle() {
+  const button = $("toggleFeatures");
+  button.textContent = showAllFeatures ? "Show core" : "Show all";
+  button.setAttribute("aria-expanded", String(showAllFeatures));
+}
+
+function renderFeatures(features) {
+  lastFeatures = features;
+  const names = showAllFeatures ? ALL_FEATURES : CORE_FEATURES;
+  rows($("features"), names.map((name) => [
+    name,
+    formatFeatureValue(name, features[name]),
+  ]));
+}
+
+$("toggleFeatures").addEventListener("click", () => {
+  showAllFeatures = !showAllFeatures;
+  try {
+    localStorage.setItem("showAllFeatures", String(showAllFeatures));
+  } catch (_) {
+    // Keep the in-memory preference when browser storage is disabled.
+  }
+  updateFeatureToggle();
+  renderFeatures(lastFeatures);
+});
+
+updateFeatureToggle();
 
 function buildSettings(config) {
   const form = $("settings");
@@ -199,11 +385,7 @@ function render(data) {
   $("stable").textContent =
     data.stableSeconds == null ? "--" : data.stableSeconds.toFixed(1) + " s";
 
-  const features = data.features || {};
-  rows($("features"), FEATURES.map((name) => [
-    name,
-    formatFeatureValue(name, features[name]),
-  ]));
+  renderFeatures(data.features || {});
 
   const stream = data.stream || {};
   rows($("stream"), STREAM_FIELDS.map(([key, label]) => [
@@ -507,6 +689,16 @@ function heading(text) {
   return h;
 }
 
+function closeEventDetail() {
+  const body = $("detailBody");
+  for (const audio of body.querySelectorAll("audio")) audio.pause();
+  releasePlaybackAudio(body);
+  $("detail").hidden = true;
+  for (const item of document.querySelectorAll("li.event.open")) {
+    item.classList.remove("open");
+  }
+}
+
 function buildReview(meta) {
   const form = document.createElement("div");
   form.className = "review-form";
@@ -519,12 +711,17 @@ function buildReview(meta) {
   choices.className = "review-actions";
   const correct = document.createElement("button");
   const wrong = document.createElement("button");
+  const save = document.createElement("button");
+  const message = document.createElement("span");
   correct.type = wrong.type = "button";
+  save.type = "button";
   correct.textContent = "Correct";
   wrong.textContent = "Wrong";
+  save.textContent = "Save review";
   correct.className = "review-choice";
   wrong.className = "review-choice";
-  choices.append(correct, wrong);
+  message.className = "note";
+  choices.append(correct, wrong, save, message);
   form.append(choices);
 
   const stateSelect = (value) => {
@@ -575,16 +772,6 @@ function buildReview(meta) {
   notes.placeholder = "Optional notes";
   field("Notes", notes);
 
-  const save = document.createElement("button");
-  save.type = "button";
-  save.textContent = "Save review";
-  const message = document.createElement("span");
-  message.className = "note";
-  const footer = document.createElement("div");
-  footer.className = "review-actions";
-  footer.append(save, message);
-  form.append(footer);
-
   const showVerdict = () => {
     correct.classList.toggle("active", verdict === true);
     wrong.classList.toggle("active", verdict === false);
@@ -623,7 +810,10 @@ function buildReview(meta) {
     });
     save.disabled = false;
     message.textContent = response.ok ? "Review saved." : "Review could not be saved.";
-    if (response.ok) loadEvents();
+    if (response.ok) {
+      closeEventDetail();
+      loadEvents();
+    }
   });
 
   return form;
@@ -649,51 +839,11 @@ async function openEvent(id, item) {
   const title = document.createElement("div");
   title.className = "state-name";
   title.style.fontSize = "24px";
-  title.textContent = `${meta.from || "--"} → ${meta.to}`;
+  title.textContent = `Name: ${meta.from || "--"} → ${meta.to}`;
   title.classList.add("state-" + meta.to);
   body.append(title);
 
-  const grid = document.createElement("div");
-  grid.className = "grid2";
-
-  const left = document.createElement("div");
-  left.append(heading("transition"), table([
-    ["time", meta.time.replace("T", " ")],
-    ["candidate held", meta.candidateHeldSeconds + " s"],
-    ["audio", `${meta.audio.seconds} s ` +
-      `(${meta.audio.preSeconds} before / ${meta.audio.postSeconds} after)`],
-  ]));
-
-  left.append(heading("features at transition"), table(
-    Object.entries(meta.featuresAtTransition).map(
-      ([k, v]) => [k, formatFeatureValue(k, v)]),
-  ));
-
-  const right = document.createElement("div");
-  right.append(heading("classifier config at the time"), table(
-    Object.entries(meta.classifierConfig).map(([k, v]) => [k, v]),
-  ));
-
-  const stats = document.createElement("table");
-  stats.className = "kv";
-  const head = stats.createTHead().insertRow();
-  for (const label of ["band", "median", "min", "max", "std"]) {
-    const th = document.createElement("th");
-    th.textContent = label;
-    head.append(th);
-  }
-  for (const [band, s] of Object.entries(meta.decisionWindow || {})) {
-    const row = stats.insertRow();
-    row.insertCell().textContent = band;
-    for (const key of ["median", "min", "max", "std"]) {
-      row.insertCell().textContent = s[key];
-    }
-  }
-  right.append(heading("decision window"), stats);
-
-  grid.append(left, right);
-  body.append(grid);
-
+  body.append(heading("recording"));
   const audio = document.createElement("audio");
   audio.controls = true;
   audio.src = `/api/events/${id}/audio`;
@@ -703,6 +853,57 @@ async function openEvent(id, item) {
   body.append(audio);
 
   body.append(buildReview(meta));
+
+  body.append(heading("graph"));
+  const chartLegend = document.createElement("div");
+  chartLegend.className = "legend";
+  const chart = document.createElement("div");
+  chart.className = "chart";
+  const note = document.createElement("p");
+  note.className = "note";
+  note.textContent = "computing…";
+  body.append(chartLegend, chart, note);
+
+  body.append(heading("full data"));
+  const grid = document.createElement("div");
+  grid.className = "grid2";
+  const left = document.createElement("div");
+  left.append(heading("transition"), table([
+    ["id", meta.id],
+    ["source", meta.source || "transition"],
+    ["time", meta.time.replace("T", " ")],
+    ["classifier", `${meta.from || "--"} → ${meta.to}`],
+    ["candidate held", meta.candidateHeldSeconds + " s"],
+    ["audio", `${meta.audio.seconds} s ` +
+      `(${meta.audio.preSeconds} before / ${meta.audio.postSeconds} after)`],
+  ]));
+  left.append(heading("features at transition"), table(
+    Object.entries(meta.featuresAtTransition).map(
+      ([k, v]) => [k, formatFeatureValue(k, v)]),
+  ));
+
+  const right = document.createElement("div");
+  right.append(heading("classifier config at the time"), table(
+    Object.entries(meta.classifierConfig).map(([k, v]) => [k, v]),
+  ));
+  const stats = document.createElement("table");
+  stats.className = "kv";
+  const head = stats.createTHead().insertRow();
+  for (const label of ["feature", "median", "min", "max", "std"]) {
+    const th = document.createElement("th");
+    th.textContent = label;
+    head.append(th);
+  }
+  for (const [feature, summary] of Object.entries(meta.decisionWindow || {})) {
+    const row = stats.insertRow();
+    row.insertCell().textContent = feature;
+    for (const key of ["median", "min", "max", "std"]) {
+      row.insertCell().textContent = summary[key];
+    }
+  }
+  right.append(heading("decision window"), stats);
+  grid.append(left, right);
+  body.append(grid);
 
   const detailActions = document.createElement("div");
   detailActions.className = "detail-actions";
@@ -719,25 +920,13 @@ async function openEvent(id, item) {
       remove.textContent = "Delete failed";
       return;
     }
-    panel.hidden = true;
+    closeEventDetail();
     selectedEventIds.delete(meta.id);
     if (eventPage > 1 && $("events").children.length === 1) eventPage -= 1;
     loadEvents();
   });
   detailActions.append(remove);
   body.append(detailActions);
-
-  body.append(heading("feature timeline, recomputed from the audio"));
-
-  const chartLegend = document.createElement("div");
-  chartLegend.className = "legend";
-  const chart = document.createElement("div");
-  chart.className = "chart";
-  const note = document.createElement("p");
-  note.className = "note";
-  body.append(chartLegend, chart, note);
-
-  note.textContent = "computing…";
 
   const timeline = await (
     await fetch(`/api/events/${id}/timeline`)
@@ -764,12 +953,7 @@ async function openEvent(id, item) {
     `before the pre-roll.`;
 }
 
-$("closeDetail").addEventListener("click", () => {
-  $("detail").hidden = true;
-  for (const other of document.querySelectorAll("li.event.open")) {
-    other.classList.remove("open");
-  }
-});
+$("closeDetail").addEventListener("click", closeEventDetail);
 
 loadHistory();
 setInterval(loadHistory, 15000);

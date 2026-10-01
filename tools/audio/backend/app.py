@@ -63,6 +63,15 @@ def _is_benign_proactor_reset(context: dict) -> bool:
     )
 
 
+def load_saved_config(settings: AppConfig) -> dict:
+    """Validate and apply persisted classifier/event settings."""
+    payload = config_module.load_runtime_config(settings.config_path)
+    changes = ConfigPatch.model_validate(payload).changes()
+    settings.classifier = settings.classifier.patched(changes)
+    settings.events = settings.events.patched(changes)
+    return changes
+
+
 def create_app(settings: AppConfig) -> FastAPI:
     service = StreamService(settings)
 
@@ -119,8 +128,20 @@ def create_app(settings: AppConfig) -> FastAPI:
         if not changes:
             return settings.to_api()
 
-        settings.classifier = settings.classifier.patched(changes)
-        settings.events = settings.events.patched(changes)
+        classifier = settings.classifier.patched(changes)
+        events = settings.events.patched(changes)
+        saved = classifier.to_api()
+        saved.update(events.to_api())
+        try:
+            config_module.write_runtime_config(settings.config_path, saved)
+        except OSError as error:
+            raise HTTPException(
+                status_code=500,
+                detail=f"could not save configuration: {error}",
+            ) from error
+
+        settings.classifier = classifier
+        settings.events = events
 
         # Applied at once, without touching the TCP connection: the
         # rules changed, not the audio.
@@ -306,6 +327,65 @@ def create_app(settings: AppConfig) -> FastAPI:
             # Socket closed under us while sending.
             return
 
+    @app.websocket("/ws/audio")
+    async def live_audio(socket: WebSocket) -> None:
+        """Raw live PCM for on-demand browser monitoring.
+
+        A bounded per-client queue drops the oldest packet when the
+        browser falls behind. Live listening should become current
+        again, never accumulate seconds of delayed audio.
+        """
+        await socket.accept()
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=8)
+
+        def enqueue(payload: bytes) -> None:
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            queue.put_nowait(payload)
+
+        def receive_audio(payload: bytes) -> None:
+            try:
+                loop.call_soon_threadsafe(enqueue, payload)
+            except RuntimeError:
+                pass
+
+        service.add_audio_listener(receive_audio)
+        last_rate = 0
+
+        try:
+            while True:
+                connected, sample_rate = service.audio_status()
+                if sample_rate and sample_rate != last_rate:
+                    await socket.send_json({
+                        "type": "format",
+                        "sampleRate": sample_rate,
+                        "channels": 1,
+                        "encoding": "s32le-24bit-right-aligned",
+                    })
+                    last_rate = sample_rate
+
+                try:
+                    payload = await asyncio.wait_for(
+                        queue.get(), timeout=1.0
+                    )
+                except TimeoutError:
+                    await socket.send_json({
+                        "type": "status",
+                        "connected": connected,
+                    })
+                    continue
+
+                if last_rate:
+                    await socket.send_bytes(payload)
+        except (WebSocketDisconnect, ConnectionError, RuntimeError):
+            return
+        finally:
+            service.remove_audio_listener(receive_audio)
+
     # ---------------------------------------------------------- UI
 
     if config_module.WEB.is_dir():
@@ -379,6 +459,14 @@ def main(argv: list[str] | None = None) -> int:
         http_port=args.port,
         live_hz=args.live_hz,
     )
+
+    try:
+        changes = load_saved_config(settings)
+    except (OSError, ValueError) as error:
+        print(f"config: ignoring invalid {settings.config_path}: {error}")
+    else:
+        if changes:
+            print(f"config: loaded {settings.config_path}")
 
     print("Backend starting")
     print(f"ESP32: {settings.target}")

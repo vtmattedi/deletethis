@@ -317,14 +317,25 @@ never classifies and never talks to the ESP32.
 | `DELETE /api/events/{id}` | delete the event JSON and WAV |
 | `GET /api/history` | compact state history |
 | `WS /ws/live` | snapshots, 5 Hz by default |
+| `WS /ws/audio` | on-demand raw PCM for low-latency browser listening |
 
 The classifier runs at the full window rate (~31/s); only the UI
 updates are throttled. Raw PCM never leaves the backend.
 
-`PATCH /api/config` applies at once without touching the TCP
-connection. The published state is kept — moving a threshold is not an
-observation — but the rolling median and the candidate are cleared, so
-the hold has to be earned again under the new rules.
+The Stream card's **Listen live** control opens `/ws/audio` only while
+monitoring is enabled. Each connection has a short bounded queue that
+drops its oldest frame if the browser falls behind, preventing delayed
+audio from accumulating. The browser resamples the 16 kHz stream via
+Web Audio and applies the locally saved playback-gain preference; the
+stream, event WAVs and classifier input remain unchanged. Use
+headphones to prevent speaker-to-microphone feedback.
+
+`PATCH /api/config` atomically saves the complete validated settings to
+`results/config.json` and applies them without touching the TCP
+connection. The backend loads that file on its next start. The
+published state is kept — moving a threshold is not an observation —
+but the rolling median and candidate are cleared, so the hold has to be
+earned again under the new rules.
 
 ### Transition events
 

@@ -7,6 +7,9 @@ The mapping lives here and nowhere else.
 
 from __future__ import annotations
 
+import json
+import os
+import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -26,6 +29,7 @@ TOOLS = HERE.parent
 RESULTS = TOOLS / "results"
 EVENTS_DIR = RESULTS / "events"
 HISTORY_DB = RESULTS / "audio.db"
+RUNTIME_CONFIG = RESULTS / "config.json"
 RECORDINGS = TOOLS / "recordings"
 WEB = TOOLS / "web"
 
@@ -133,9 +137,37 @@ class AppConfig:
 
     events_dir: Path = EVENTS_DIR
     history_path: Path = HISTORY_DB
+    config_path: Path = RUNTIME_CONFIG
 
     def to_api(self) -> dict:
         payload = self.classifier.to_api()
         payload.update(self.events.to_api())
 
         return payload
+
+
+def load_runtime_config(path: Path) -> dict:
+    """Load the saved API-shaped settings, or defaults when absent."""
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("saved config must be a JSON object")
+    return payload
+
+
+def write_runtime_config(path: Path, payload: dict) -> None:
+    """Atomically replace the persisted runtime settings."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass

@@ -16,6 +16,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 from acstream import AudioStream, ProtocolError
 
@@ -70,6 +71,7 @@ class StreamService(threading.Thread):
 
         self.lock = threading.Lock()
         self.health = StreamHealth()
+        self.audio_listeners: set[Callable[[bytes], None]] = set()
 
         # Built on the first connection, once the device has told us
         # its sample rate rather than us assuming one.
@@ -148,6 +150,10 @@ class StreamService(threading.Thread):
         assert self.classifier is not None
         assert self.events is not None
 
+        # Listening is opt-in. Avoid allocating audio packets when no
+        # browser has the live monitor open.
+        self._publish_audio(samples)
+
         produced = self.classifier.push(samples)
 
         # One row a second, rate-limited inside the store.
@@ -170,6 +176,36 @@ class StreamService(threading.Thread):
                 continue
 
             self._on_transition(decision)
+
+    def add_audio_listener(self, listener: Callable[[bytes], None]) -> None:
+        with self.lock:
+            self.audio_listeners.add(listener)
+
+    def remove_audio_listener(self, listener: Callable[[bytes], None]) -> None:
+        with self.lock:
+            self.audio_listeners.discard(listener)
+
+    def _publish_audio(self, samples) -> None:
+        with self.lock:
+            listeners = tuple(self.audio_listeners)
+        if not listeners:
+            return
+
+        # Explicit little-endian signed int32 containers. Values remain
+        # right-aligned 24-bit microphone samples, exactly as received.
+        payload = samples.astype("<i4", copy=False).tobytes()
+        for listener in listeners:
+            try:
+                listener(payload)
+            except RuntimeError:
+                # The owning event loop may have closed between the
+                # listener snapshot and this delivery.
+                self.remove_audio_listener(listener)
+
+    def audio_status(self) -> tuple[bool, int]:
+        """Return only what a live-audio client needs, without DB work."""
+        with self.lock:
+            return self.health.connected, self.health.sample_rate
 
     def _on_transition(self, decision) -> None:
         assert self.classifier is not None
