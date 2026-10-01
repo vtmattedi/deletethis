@@ -455,25 +455,46 @@ class EventRecorder:
 
     def review(self, identifier: str, review: dict) -> dict | None:
         """Replace the human review and atomically persist the JSON."""
-        with self.lock:
-            metadata = next(
-                (
-                    item for item in reversed(self.written)
-                    if item.get("id") == identifier
-                ),
-                None,
-            )
-            if metadata is None:
-                return None
+        updated, missing = self.review_many({identifier: review})
+        return None if missing else updated[0]
 
-            updated_review = {"status": "reviewed", **review}
-            updated = {**metadata, "review": updated_review}
-            path = self._event_path(identifier, ".json")
-            if path is None:
-                return None
-            self._write_json_atomic(path, updated)
-            metadata["review"] = updated_review
-            return dict(metadata)
+    def review_many(
+        self, reviews: dict[str, dict]
+    ) -> tuple[list[dict], list[str]]:
+        """Atomically replace each JSON file after validating all ids.
+
+        Every event is resolved before the first write, so a stale or
+        invalid selection cannot partially review the events that still
+        exist. Each individual JSON replacement remains atomic.
+        """
+        with self.lock:
+            by_id = {
+                item.get("id"): item for item in self.written
+                if item.get("id") in reviews
+            }
+            missing = [
+                identifier for identifier in reviews
+                if identifier not in by_id
+            ]
+            if missing:
+                return [], missing
+
+            pending = []
+            for identifier, review in reviews.items():
+                metadata = by_id[identifier]
+                updated_review = {"status": "reviewed", **review}
+                updated = {**metadata, "review": updated_review}
+                path = self._event_path(identifier, ".json")
+                if path is None:
+                    return [], [identifier]
+                pending.append((metadata, updated_review, updated, path))
+
+            for _metadata, _review, updated, path in pending:
+                self._write_json_atomic(path, updated)
+            for metadata, updated_review, _updated, _path in pending:
+                metadata["review"] = updated_review
+
+            return [dict(metadata) for metadata, *_rest in pending], []
 
     def delete(self, identifier: str) -> bool:
         """Delete one completed event's self-contained JSON/WAV pair."""

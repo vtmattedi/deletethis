@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ConfigPatch(BaseModel):
@@ -62,3 +62,27 @@ class EventDeleteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class EventBulkReviewRequest(BaseModel):
+    """Apply one review decision to a bounded event selection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ids: list[str] = Field(min_length=1, max_length=100)
+    classificationCorrect: bool
+    actualFrom: StateLabel | None = None
+    actualTo: StateLabel | None = None
+    interference: list[str] = Field(default_factory=list)
+    notes: str = Field(default="", max_length=10000)
+
+    @model_validator(mode="after")
+    def require_labels_for_incorrect_review(self):
+        if not self.classificationCorrect and (
+            self.actualFrom is None or self.actualTo is None
+        ):
+            raise ValueError(
+                "actualFrom and actualTo are required when marking "
+                "events incorrect"
+            )
+        return self

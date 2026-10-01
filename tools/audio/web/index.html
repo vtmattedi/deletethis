@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>INMP441 Live</title>
-<link rel="stylesheet" href="style.css?v=20260930-5">
+<link rel="stylesheet" href="style.css?v=20261001-1">
 </head>
 <body>
 <header>
@@ -92,10 +92,14 @@
         <input id="selectAllEvents" type="checkbox">
         <span>Select this page</span>
       </label>
+      <button id="reviewSelectedEvents" type="button" disabled>
+        Review selected
+      </button>
       <button id="deleteSelectedEvents" class="danger" type="button" disabled>
         Delete selected
       </button>
       <span id="selectionCount" class="note">0 selected</span>
+      <span id="bulkActionNote" class="note"></span>
     </div>
     <ul id="events"></ul>
     <div class="pager">
@@ -103,6 +107,15 @@
       <span id="eventPage" class="note"></span>
       <button id="nextEvents" type="button">Next</button>
     </div>
+  </section>
+
+  <section class="card wide" id="bulkReview" hidden>
+    <div class="head">
+      <h2>Review selected events</h2>
+      <button id="closeBulkReview" type="button">close</button>
+    </div>
+    <p id="bulkReviewSummary" class="note"></p>
+    <div id="bulkReviewBody"></div>
   </section>
 
   <section class="card wide" id="detail" hidden>
@@ -114,6 +127,6 @@
   </section>
 </main>
 
-<script type="module" src="app.js?v=20260930-7"></script>
+<script type="module" src="app.js?v=20261001-2"></script>
 </body>
 </html>

@@ -47,6 +47,7 @@ let eventPages = 0;
 const EVENT_PAGE_SIZE = 10;
 const selectedEventIds = new Set();
 let visibleEventIds = [];
+let rangeSelectionAnchor = null;
 let audioPlaybackContext = null;
 const boostedAudio = new WeakMap();
 const activePlaybackGains = new Set();
@@ -436,6 +437,7 @@ async function loadEvents() {
   }
   eventPages = data.pages;
   visibleEventIds = events.map((event) => event.id);
+  rangeSelectionAnchor = null;
   const list = $("events");
   releasePlaybackAudio(list);
   list.textContent = "";
@@ -465,11 +467,28 @@ async function loadEvents() {
     const select = document.createElement("input");
     select.type = "checkbox";
     select.className = "event-select";
+    select.dataset.eventId = event.id;
     select.checked = selectedEventIds.has(event.id);
     select.setAttribute("aria-label", `Select event ${event.id}`);
-    select.addEventListener("change", () => {
-      if (select.checked) selectedEventIds.add(event.id);
-      else selectedEventIds.delete(event.id);
+    select.addEventListener("click", (clickEvent) => {
+      const anchorIndex = visibleEventIds.indexOf(rangeSelectionAnchor);
+      const currentIndex = visibleEventIds.indexOf(event.id);
+      if (clickEvent.shiftKey && anchorIndex >= 0 && currentIndex >= 0) {
+        const start = Math.min(anchorIndex, currentIndex);
+        const end = Math.max(anchorIndex, currentIndex);
+        for (const identifier of visibleEventIds.slice(start, end + 1)) {
+          if (select.checked) selectedEventIds.add(identifier);
+          else selectedEventIds.delete(identifier);
+        }
+        for (const checkbox of document.querySelectorAll(".event-select")) {
+          checkbox.checked = selectedEventIds.has(checkbox.dataset.eventId);
+        }
+      } else if (select.checked) {
+        selectedEventIds.add(event.id);
+      } else {
+        selectedEventIds.delete(event.id);
+      }
+      rangeSelectionAnchor = event.id;
       updateEventSelection();
     });
 
@@ -481,11 +500,47 @@ async function loadEvents() {
     what.textContent = `${event.from || "--"} → ${event.to}`;
 
     const review = document.createElement("span");
-    const correctness = event.review?.status === "reviewed"
+    let correctness = event.review?.status === "reviewed"
       ? (event.review.classificationCorrect ? "correct" : "incorrect")
       : "unreviewed";
     review.className = `review-status review-${correctness}`;
     review.textContent = correctness;
+
+    const quickCorrect = document.createElement("button");
+    quickCorrect.type = "button";
+    quickCorrect.className = "quick-correct";
+    quickCorrect.textContent = correctness === "correct" ? "Correct ✓" : "Correct";
+    quickCorrect.title = "Mark correct with no interference or notes";
+    quickCorrect.disabled = correctness === "correct";
+    quickCorrect.addEventListener("click", async () => {
+      quickCorrect.disabled = true;
+      quickCorrect.textContent = "Saving…";
+      try {
+        const response = await fetch(`/api/events/${event.id}/review`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            classificationCorrect: true,
+            actualFrom: event.from || "UNKNOWN",
+            actualTo: event.to || "UNKNOWN",
+            interference: [],
+            notes: "",
+          }),
+        });
+        if (!response.ok) throw new Error("review request failed");
+
+        const updated = await response.json();
+        event.review = updated.review;
+        correctness = "correct";
+        review.className = "review-status review-correct";
+        review.textContent = "correct";
+        quickCorrect.textContent = "Correct ✓";
+        if (item.classList.contains("open")) openEvent(event.id, item);
+      } catch (_) {
+        quickCorrect.disabled = false;
+        quickCorrect.textContent = "Retry correct";
+      }
+    });
 
     const held = document.createElement("span");
     held.className = "note";
@@ -500,7 +555,7 @@ async function loadEvents() {
     audio.src = `/api/events/${event.id}/audio`;
     enablePlaybackGain(audio);
 
-    item.append(select, when, what, review, held, audio);
+    item.append(select, when, what, review, quickCorrect, held, audio);
     list.append(item);
   }
 }
@@ -508,6 +563,7 @@ async function loadEvents() {
 function updateEventSelection() {
   const count = selectedEventIds.size;
   $("selectionCount").textContent = `${count} selected`;
+  $("reviewSelectedEvents").disabled = count === 0;
   $("deleteSelectedEvents").disabled = count === 0;
 
   const selectAll = $("selectAllEvents");
@@ -519,6 +575,157 @@ function updateEventSelection() {
   selectAll.indeterminate = visibleSelected > 0 &&
     visibleSelected < visibleEventIds.length;
   selectAll.disabled = visibleEventIds.length === 0;
+}
+
+function closeBulkReview() {
+  $("bulkReview").hidden = true;
+  $("bulkReviewBody").textContent = "";
+}
+
+function openBulkReview() {
+  const identifiers = [...selectedEventIds];
+  if (!identifiers.length) return;
+
+  const panel = $("bulkReview");
+  const body = $("bulkReviewBody");
+  $("bulkActionNote").textContent = "";
+  $("bulkReviewSummary").textContent =
+    `This review will be applied to ${identifiers.length} selected event` +
+    `${identifiers.length === 1 ? "" : "s"}. Correct uses each event's ` +
+    "own classifier transition.";
+  body.textContent = "";
+
+  const form = document.createElement("div");
+  form.className = "review-form";
+  let verdict = null;
+
+  const choices = document.createElement("div");
+  choices.className = "review-actions";
+  const correct = document.createElement("button");
+  const wrong = document.createElement("button");
+  const save = document.createElement("button");
+  const message = document.createElement("span");
+  correct.type = wrong.type = save.type = "button";
+  correct.textContent = "Correct";
+  wrong.textContent = "Wrong";
+  save.textContent = "Save reviews";
+  correct.className = wrong.className = "review-choice";
+  message.className = "note";
+  choices.append(correct, wrong, save, message);
+  form.append(choices);
+
+  const stateSelect = () => {
+    const select = document.createElement("select");
+    const blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = "Select…";
+    select.append(blank);
+    for (const state of ["OFF", "FAN", "COMPRESSOR", "UNKNOWN"]) {
+      const option = document.createElement("option");
+      option.value = option.textContent = state;
+      select.append(option);
+    }
+    return select;
+  };
+  const field = (labelText, control) => {
+    const label = document.createElement("label");
+    const name = document.createElement("span");
+    name.textContent = labelText;
+    label.append(name, control);
+    form.append(label);
+  };
+
+  const actualFrom = stateSelect();
+  const actualTo = stateSelect();
+  field("Actual from", actualFrom);
+  field("Actual to", actualTo);
+
+  const tags = document.createElement("div");
+  tags.className = "review-tags";
+  for (const tag of ["talking", "printer", "tv", "other"]) {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    const text = document.createElement("span");
+    input.type = "checkbox";
+    input.value = tag;
+    text.textContent = tag;
+    label.append(input, text);
+    tags.append(label);
+  }
+  field("Interference", tags);
+
+  const notes = document.createElement("textarea");
+  notes.placeholder = "Optional notes applied to every selected event";
+  field("Notes", notes);
+
+  const showVerdict = () => {
+    correct.classList.toggle("active", verdict === true);
+    wrong.classList.toggle("active", verdict === false);
+    actualFrom.disabled = verdict === true;
+    actualTo.disabled = verdict === true;
+    if (verdict === true) {
+      actualFrom.value = "";
+      actualTo.value = "";
+    }
+  };
+  correct.addEventListener("click", () => {
+    verdict = true;
+    showVerdict();
+    message.textContent = "Each event will use its own classifier labels.";
+  });
+  wrong.addEventListener("click", () => {
+    verdict = false;
+    showVerdict();
+    message.textContent = "";
+  });
+  showVerdict();
+
+  save.addEventListener("click", async () => {
+    if (verdict === null) {
+      message.textContent = "Choose Correct or Wrong.";
+      return;
+    }
+    if (verdict === false && (!actualFrom.value || !actualTo.value)) {
+      message.textContent = "Choose both actual states for an incorrect review.";
+      return;
+    }
+
+    const payload = {
+      ids: identifiers,
+      classificationCorrect: verdict,
+      interference: [...tags.querySelectorAll("input:checked")]
+        .map((input) => input.value),
+      notes: notes.value,
+    };
+    if (verdict === false) {
+      payload.actualFrom = actualFrom.value;
+      payload.actualTo = actualTo.value;
+    }
+
+    save.disabled = true;
+    message.textContent = "Saving…";
+    const response = await fetch("/api/events/reviews", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      save.disabled = false;
+      message.textContent = "Reviews could not be saved. Refresh and retry.";
+      return;
+    }
+
+    const result = await response.json();
+    for (const identifier of result.updated) selectedEventIds.delete(identifier);
+    closeBulkReview();
+    await loadEvents();
+    $("bulkActionNote").textContent =
+      `${result.count} review${result.count === 1 ? "" : "s"} saved.`;
+  });
+
+  body.append(form);
+  panel.hidden = false;
+  panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 async function deleteSelectedEvents() {
@@ -548,6 +755,7 @@ async function deleteSelectedEvents() {
   for (const identifier of result.deleted) selectedEventIds.delete(identifier);
   for (const identifier of result.notFound) selectedEventIds.delete(identifier);
   button.textContent = "Delete selected";
+  closeBulkReview();
   $("detail").hidden = true;
   await loadEvents();
 }
@@ -563,6 +771,8 @@ $("selectAllEvents").addEventListener("change", (event) => {
   updateEventSelection();
 });
 $("deleteSelectedEvents").addEventListener("click", deleteSelectedEvents);
+$("reviewSelectedEvents").addEventListener("click", openBulkReview);
+$("closeBulkReview").addEventListener("click", closeBulkReview);
 
 async function recordEvent() {
   const button = $("recordEvent");

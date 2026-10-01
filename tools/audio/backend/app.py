@@ -23,14 +23,24 @@ if __package__ in (None, ""):
     from backend.config import ClassifierConfig
     from backend.events import event_timeline
     from backend.history import to_epoch
-    from backend.models import ConfigPatch, EventDeleteRequest, ReviewPatch
+    from backend.models import (
+        ConfigPatch,
+        EventBulkReviewRequest,
+        EventDeleteRequest,
+        ReviewPatch,
+    )
     from backend.stream import StreamService
 else:
     from . import config as config_module
     from .config import ClassifierConfig
     from .events import event_timeline
     from .history import to_epoch
-    from .models import ConfigPatch, EventDeleteRequest, ReviewPatch
+    from .models import (
+        ConfigPatch,
+        EventBulkReviewRequest,
+        EventDeleteRequest,
+        ReviewPatch,
+    )
     from .stream import StreamService
 
 import uvicorn
@@ -192,6 +202,49 @@ def create_app(settings: AppConfig) -> FastAPI:
             else:
                 not_found.append(identifier)
         return {"deleted": deleted, "notFound": not_found}
+
+    @app.patch("/api/events/reviews")
+    async def patch_event_reviews(
+        request: EventBulkReviewRequest,
+    ) -> dict:
+        if service.events is None:
+            raise HTTPException(status_code=404, detail="no event store")
+
+        identifiers = list(dict.fromkeys(request.ids))
+        reviews = {}
+        for identifier in identifiers:
+            metadata = service.events.get(identifier)
+            if metadata is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"message": "event selection is stale", "ids": [identifier]},
+                )
+
+            if request.classificationCorrect:
+                actual_from = metadata.get("from") or "UNKNOWN"
+                actual_to = metadata.get("to") or "UNKNOWN"
+            else:
+                actual_from = request.actualFrom
+                actual_to = request.actualTo
+
+            reviews[identifier] = {
+                "classificationCorrect": request.classificationCorrect,
+                "actualFrom": actual_from,
+                "actualTo": actual_to,
+                "interference": request.interference,
+                "notes": request.notes,
+            }
+
+        updated, missing = service.events.review_many(reviews)
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail={"message": "event selection is stale", "ids": missing},
+            )
+        return {
+            "updated": [metadata["id"] for metadata in updated],
+            "count": len(updated),
+        }
 
     @app.get("/api/events/{identifier}")
     async def get_event(identifier: str) -> dict:

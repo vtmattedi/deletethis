@@ -79,6 +79,8 @@ li.event.open { background: #20242e; }
 .review-unreviewed { background: #343946; color: var(--dim); }
 .review-correct { background: #163f29; color: #72d99a; }
 .review-incorrect { background: #4b2424; color: #ff9c9c; }
+.quick-correct { padding: 2px 7px; font-size: 12px; }
+.quick-correct:disabled { color: #72d99a; opacity: .75; }
 .event-tools, .selection-tools, .pager, .review-actions, .review-tags,
 .detail-actions {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;

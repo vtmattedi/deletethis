@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sys
 import tempfile
@@ -10,9 +11,14 @@ import numpy as np
 TOOLS = Path(__file__).resolve().parents[1] / "tools" / "audio"
 sys.path.insert(0, str(TOOLS))
 
-from backend.config import ClassifierConfig, EventConfig  # noqa: E402
+from backend.app import create_app  # noqa: E402
+from backend.config import AppConfig, ClassifierConfig, EventConfig  # noqa: E402
 from backend.events import EventRecorder  # noqa: E402
-from backend.models import EventDeleteRequest, ReviewPatch  # noqa: E402
+from backend.models import (  # noqa: E402
+    EventBulkReviewRequest,
+    EventDeleteRequest,
+    ReviewPatch,
+)
 from pydantic import ValidationError  # noqa: E402
 
 
@@ -29,11 +35,16 @@ class EventRecorderTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def write_event(self, source="transition"):
+    def write_event(
+        self,
+        source="transition",
+        from_state="FAN",
+        to_state="COMPRESSOR",
+    ):
         self.recorder.push(np.arange(10, dtype=np.int32))
         identifier = self.recorder.start(
-            from_state="FAN",
-            to_state="COMPRESSOR",
+            from_state=from_state,
+            to_state=to_state,
             stable_seconds=2.5,
             stream_time=10.0,
             features={"rms": -30.0},
@@ -117,6 +128,88 @@ class EventRecorderTests(unittest.TestCase):
             EventDeleteRequest.model_validate({"ids": []})
         with self.assertRaises(ValidationError):
             EventDeleteRequest.model_validate({"ids": ["x"] * 101})
+
+    def test_bulk_review_validates_before_writing(self):
+        first = self.write_event()
+        second = self.write_event()
+        review = {
+            "classificationCorrect": False,
+            "actualFrom": "OFF",
+            "actualTo": "FAN",
+            "interference": ["tv"],
+            "notes": "same disturbance",
+        }
+
+        updated, missing = self.recorder.review_many({
+            first: review,
+            "missing": review,
+        })
+        self.assertEqual(updated, [])
+        self.assertEqual(missing, ["missing"])
+        self.assertEqual(
+            self.recorder.get(first)["review"], {"status": "unreviewed"}
+        )
+
+        updated, missing = self.recorder.review_many({
+            first: review,
+            second: review,
+        })
+        self.assertEqual(missing, [])
+        self.assertEqual({item["id"] for item in updated}, {first, second})
+        self.assertTrue(all(
+            item["review"]["actualFrom"] == "OFF" for item in updated
+        ))
+
+    def test_bulk_correct_can_omit_shared_actual_labels(self):
+        request = EventBulkReviewRequest.model_validate({
+            "ids": ["one", "two"],
+            "classificationCorrect": True,
+        })
+        self.assertIsNone(request.actualFrom)
+
+        with self.assertRaises(ValidationError):
+            EventBulkReviewRequest.model_validate({
+                "ids": ["one"],
+                "classificationCorrect": False,
+            })
+
+    def test_bulk_correct_uses_each_events_own_classifier_labels(self):
+        first = self.write_event(from_state="OFF", to_state="FAN")
+        second = self.write_event(
+            from_state="FAN", to_state="COMPRESSOR"
+        )
+        app = create_app(AppConfig(
+            history_path=self.directory / "api-history.db",
+            events_dir=self.directory,
+        ))
+        app.state.service.events = self.recorder
+        endpoint = next(
+            route.endpoint for route in app.routes
+            if getattr(route, "path", None) == "/api/events/reviews"
+            and "PATCH" in getattr(route, "methods", set())
+        )
+        request = EventBulkReviewRequest(
+            ids=[first, second],
+            classificationCorrect=True,
+        )
+
+        result = asyncio.run(endpoint(request))
+        app.state.service.close()
+
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(
+            self.recorder.get(first)["review"]["actualFrom"], "OFF"
+        )
+        self.assertEqual(
+            self.recorder.get(first)["review"]["actualTo"], "FAN"
+        )
+        self.assertEqual(
+            self.recorder.get(second)["review"]["actualFrom"], "FAN"
+        )
+        self.assertEqual(
+            self.recorder.get(second)["review"]["actualTo"],
+            "COMPRESSOR",
+        )
 
 
 if __name__ == "__main__":
