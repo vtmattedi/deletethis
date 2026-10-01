@@ -16,8 +16,8 @@ without a reflash.
 Features are computed on exactly the same terms as analyze.py --
 1024-sample windows, 50% overlap, Hamming, spectral band power in dBFS
 plus true time-domain RMS -- so a threshold read off an analyze.py
-table means the same thing here. ``test_equivalence`` in the tests
-below pins that down.
+table means the same thing here. The shared-feature regression tests
+pin the original rule inputs down numerically.
 
 The rules are hierarchical and deliberately simple:
 
@@ -50,7 +50,6 @@ from pathlib import Path
 
 import numpy as np
 from scipy.io import wavfile
-from scipy.signal import get_window
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -62,30 +61,26 @@ from acstream import (  # noqa: E402
     list_ports,
 )
 from analyze import (  # noqa: E402
-    BANDS,
-    DB_FLOOR,
     DEFAULT_RECORDINGS,
     DEFAULT_RESULTS,
     format_table,
     infer_labels,
-    power_to_db,
     to_float,
+)
+from features import (  # noqa: E402
+    DEFAULT_NFFT,
+    DEFAULT_OVERLAP,
+    DIAGNOSTIC_BANDS,
+    FEATURE_NAMES,
+    RULE_BANDS,
+    FeatureExtractor,
+    Features,
 )
 
 # The states this classifier can report, in escalation order.
 OFF = "OFF"
 FAN = "FAN"
 COMPRESSOR = "COMPRESSOR"
-
-# Bands the v1 rules need, plus the two diagnostics. Looked up by name
-# in analyze.BANDS so the edges cannot drift apart from the offline
-# tool; a rename there becomes a KeyError here rather than a silently
-# different band.
-RULE_BANDS = ["30-80", "500-1k", "1k-2k"]
-DIAGNOSTIC_BANDS = ["200-1200"]
-
-DEFAULT_NFFT = 1024
-DEFAULT_OVERLAP = 0.5
 
 # Measured against the 18 labelled recordings with --replay. See the
 # module docstring for what the numbers are worth and where they fail.
@@ -107,159 +102,6 @@ DEFAULT_FAN_REQUIRE = "both"
 DEFAULT_HOLD_SECONDS = 2.0
 DEFAULT_MEDIAN_SECONDS = 0.5
 DEFAULT_REFRESH_HZ = 5.0
-
-
-def band_edges(name: str) -> tuple[float, float]:
-    for band_name, low, high in BANDS:
-        if band_name == name:
-            return low, high
-
-    raise KeyError(
-        f"analyze.BANDS has no band {name!r}; "
-        f"available: {[n for n, _, _ in BANDS]}"
-    )
-
-
-# ---------------------------------------------------------------------
-# Feature extraction
-# ---------------------------------------------------------------------
-
-
-def window_power(
-    block: np.ndarray,
-    window: np.ndarray,
-) -> np.ndarray:
-    """One window -> per-bin power.
-
-    Matches scipy.signal.spectrogram(detrend="constant",
-    scaling="spectrum", mode="psd"), which is what analyse_file() uses,
-    so one live window equals one column of an offline spectrogram.
-    """
-    centred = block - block.mean()
-
-    spectrum = np.fft.rfft(centred * window)
-
-    power = (
-        spectrum.real ** 2 + spectrum.imag ** 2
-    ) / window.sum() ** 2
-
-    # One-sided: every bin but DC, and Nyquist when the length is even,
-    # stands in for its mirror image too.
-    if block.size % 2 == 0:
-        power[1:-1] *= 2.0
-    else:
-        power[1:] *= 2.0
-
-    return power
-
-
-@dataclass
-class Features:
-    """One analysis window."""
-
-    time: float
-    rms_db: float
-    bands: dict[str, float]
-
-
-class FeatureExtractor:
-    """Turns a stream of frames into overlapping analysis windows."""
-
-    def __init__(
-        self,
-        sample_rate: int,
-        nfft: int = DEFAULT_NFFT,
-        overlap: float = DEFAULT_OVERLAP,
-    ) -> None:
-        self.sample_rate = sample_rate
-        self.nfft = nfft
-        self.hop = nfft - int(nfft * overlap)
-
-        # Periodic, as scipy.signal.spectrogram uses. np.hamming is
-        # symmetric and would give slightly different numbers.
-        self.window = get_window("hamming", nfft)
-
-        self.freqs = np.fft.rfftfreq(nfft, 1.0 / sample_rate)
-
-        self.masks = {
-            name: (self.freqs >= low) & (self.freqs < high)
-            for name, low, high in (
-                (name, *band_edges(name))
-                for name in RULE_BANDS + DIAGNOSTIC_BANDS
-            )
-        }
-
-        self.buffer = np.zeros(0, dtype=np.float64)
-        self.samples_seen = 0
-
-    def reset(self, skip_samples: int = 0) -> None:
-        """Drop the partial window after a gap in the audio.
-
-        Without this, the samples either side of a lost frame are
-        concatenated and the next window straddles the gap: a window
-        of audio that was never contiguous, with a step discontinuity
-        in the middle that smears energy across the whole spectrum.
-        That one bad window is enough to move a band level by tens of
-        dB, so it must not reach the classifier at all.
-
-        ``skip_samples`` advances the time axis over the gap so that
-        stability timings stay in real time. The samples still sitting
-        in the buffer are counted too: they were received but will
-        never be emitted as a window, and leaving them out would make
-        the clock lag further behind on every dropout.
-        """
-        self.samples_seen += self.buffer.size + skip_samples
-        self.buffer = np.zeros(0, dtype=np.float64)
-
-    def push(self, samples: np.ndarray) -> list[Features]:
-        """Add a frame, return every window it completes."""
-        block = samples.astype(np.float64) / FULL_SCALE
-
-        self.buffer = (
-            block
-            if self.buffer.size == 0
-            else np.concatenate((self.buffer, block))
-        )
-
-        produced: list[Features] = []
-
-        while self.buffer.size >= self.nfft:
-            window_samples = self.buffer[: self.nfft]
-
-            produced.append(
-                self._analyse(window_samples)
-            )
-
-            self.buffer = self.buffer[self.hop :]
-            self.samples_seen += self.hop
-
-        return produced
-
-    def _analyse(self, block: np.ndarray) -> Features:
-        centred = block - block.mean()
-
-        rms_db = float(
-            power_to_db(float(np.mean(centred * centred)))
-        )
-
-        power = window_power(block, self.window)
-
-        bands = {}
-
-        for name, mask in self.masks.items():
-            if not mask.any():
-                bands[name] = DB_FLOOR
-                continue
-
-            bands[name] = float(
-                power_to_db(float(power[mask].sum()))
-            )
-
-        return Features(
-            time=self.samples_seen / self.sample_rate,
-            rms_db=rms_db,
-            bands=bands,
-        )
 
 
 # ---------------------------------------------------------------------
@@ -536,6 +378,7 @@ class ReplayResult:
     interference: str
 
     predictions: list[str | None]
+    features: list[dict[str, float]]
     window_rate: float
 
     @property
@@ -599,6 +442,7 @@ def replay_file(
     )
 
     predictions: list[str | None] = []
+    feature_rows: list[dict[str, float]] = []
 
     # Fed in frames the size the ESP32 actually sends, so the window
     # boundaries land exactly where they would live.
@@ -606,6 +450,7 @@ def replay_file(
         chunk = signal[start : start + frame_samples]
 
         for features in extractor.push(chunk):
+            feature_rows.append(features.values)
             predictions.append(smoother.update(features).state)
 
     labels = infer_labels(path)
@@ -615,6 +460,7 @@ def replay_file(
         expected=labels.state.upper(),
         interference=labels.interference,
         predictions=predictions,
+        features=feature_rows,
         window_rate=window_rate,
     )
 
@@ -719,7 +565,9 @@ def write_replay_csv(path: Path, results: list[ReplayResult]) -> None:
         writer = csv.writer(handle)
 
         writer.writerow(
-            ["file", "expected", "interference", "t", "predicted"]
+            ["file", "expected", "interference", "t"]
+            + FEATURE_NAMES
+            + ["predicted"]
         )
 
         for result in results:
@@ -730,8 +578,12 @@ def write_replay_csv(path: Path, results: list[ReplayResult]) -> None:
                         result.expected,
                         result.interference,
                         f"{index / result.window_rate:.3f}",
-                        prediction or "",
                     ]
+                    + [
+                        f"{result.features[index][name]:.6g}"
+                        for name in FEATURE_NAMES
+                    ]
+                    + [prediction or ""]
                 )
 
 
@@ -1103,9 +955,8 @@ def run(args: argparse.Namespace) -> int:
         log_handle = args.log.open("w", newline="", encoding="utf-8")
         log_writer = csv.writer(log_handle)
         log_writer.writerow(
-            ["t", "rms_db"]
-            + RULE_BANDS
-            + DIAGNOSTIC_BANDS
+            ["t"]
+            + FEATURE_NAMES
             + ["candidate", "stable_s", "state"]
         )
 
@@ -1156,10 +1007,10 @@ def run(args: argparse.Namespace) -> int:
 
                 if log_writer is not None:
                     log_writer.writerow(
-                        [f"{features.time:.3f}", f"{features.rms_db:.2f}"]
+                        [f"{features.time:.3f}"]
                         + [
-                            f"{features.bands[name]:.2f}"
-                            for name in RULE_BANDS + DIAGNOSTIC_BANDS
+                            f"{features.values[name]:.6g}"
+                            for name in FEATURE_NAMES
                         ]
                         + [
                             decision.candidate,

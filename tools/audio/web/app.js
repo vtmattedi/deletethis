@@ -3,7 +3,17 @@
 
 import { lineChart, legend } from "./charts.js";
 
-const FEATURES = ["rms", "30-80", "500-1k", "1k-2k", "200-1200"];
+const FEATURES = [
+  "rms", "30-80", "80-200", "200-500", "500-1k", "1k-2k",
+  "2k-4k", "200-1200", "1500-4000", "peak_hz",
+  "spectral_centroid", "spectral_flatness", "spectral_crest",
+  "spectral_flux", "500-1k_minus_rms", "1k-2k_minus_rms",
+  "2k-4k_minus_rms", "500-1k_minus_200-500",
+  "1k-2k_minus_500-1k", "2k-4k_minus_500-1k",
+  "1500-4000_minus_200-1200", "rms_std", "500-1k_std",
+  "1k-2k_std", "2k-4k_std", "spectral_flux_median",
+  "spectral_flux_std",
+];
 
 const STREAM_FIELDS = [
   ["connected", "TCP"],
@@ -82,6 +92,15 @@ function rows(table, pairs) {
     left.className = "name";
     row.insertCell().textContent = value;
   }
+}
+
+function formatFeatureValue(name, value) {
+  if (value == null) return "--";
+  if (name === "peak_hz" || name === "spectral_centroid") {
+    return value.toFixed(0) + " Hz";
+  }
+  if (name.startsWith("spectral_")) return value.toFixed(4);
+  return value.toFixed(2) + " dB";
 }
 
 function buildSettings(config) {
@@ -183,7 +202,7 @@ function render(data) {
   const features = data.features || {};
   rows($("features"), FEATURES.map((name) => [
     name,
-    features[name] == null ? "--" : features[name].toFixed(1) + " dB",
+    formatFeatureValue(name, features[name]),
   ]));
 
   const stream = data.stream || {};
@@ -647,7 +666,7 @@ async function openEvent(id, item) {
 
   left.append(heading("features at transition"), table(
     Object.entries(meta.featuresAtTransition).map(
-      ([k, v]) => [k, v + " dB"]),
+      ([k, v]) => [k, formatFeatureValue(k, v)]),
   ));
 
   const right = document.createElement("div");

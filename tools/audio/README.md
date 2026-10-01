@@ -144,6 +144,7 @@ numbers are stripped, so both `off_01.wav` and the timestamped name
 ```
 python tools/audio/analyze.py                       # everything
 python tools/audio/analyze.py --plots --csv
+python tools/audio/analyze.py --fan-separation
 python tools/audio/analyze.py --nfft 4096           # 1024 / 2048 / 4096
 ```
 
@@ -203,6 +204,27 @@ though it is far above every threshold.
 Features are computed on exactly the same terms as `analyze.py` —
 verified bit-exact, not merely by eye — so a threshold read off an
 analyze.py table means the same thing here.
+
+Both paths import `features.py`. In addition to RMS and the original
+rule bands, it produces 80–200, 200–500, 2–4 kHz, the two wider bands,
+dominant peak, spectral centroid/flatness/crest/flux, seven relative
+spectral-shape differences, and rolling 2 s stability values. These are
+diagnostics only: classification still reads exactly 30–80, 500–1k and
+1k–2k with the existing thresholds, median and hold.
+
+`analyze.py --fan-separation` ranks every shared feature for FAN versus
+OFF/noise. It reports medians, P10/P90, directional ROC AUC and overlap,
+while keeping each interference label visible. Each observation is one
+recording median—not an adjacent FFT window—so long recordings cannot
+dominate and there is no window-level train/test leakage. Future model
+experiments must likewise split by recording, preferably by session or
+day.
+
+For the next dataset pass, record separate sessions for OFF and FAN
+with TV, printer idle, printer moving, talking, music, and miscellaneous
+loud noises. Prefer several independent files per condition over one
+long file; names such as `off_printer_moving_01.wav` preserve the
+interference label in CSV and separation reports.
 
 If the serial link loses frames, the window that would have spanned
 the gap is discarded rather than built out of audio either side of it.
@@ -351,9 +373,10 @@ to an unreviewed review block when indexed.
 ### History
 
 One row per second in SQLite at `results/audio.db`: state, candidate,
-hold, RMS, the four bands, and the frame counters. About 86k rows a
-day, which SQLite does not notice. The ~31 classifier windows per
-second are deliberately *not* stored — they only matter around a
+hold, RMS, the original compact bands, 500–1k/1–2k rolling standard
+deviation, spectral flux/flatness, and the frame counters. About 86k
+rows a day, which SQLite does not notice. The ~31 classifier windows
+per second are deliberately *not* stored — they only matter around a
 transition, and that is what the event WAVs are for.
 
 ```

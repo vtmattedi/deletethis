@@ -23,6 +23,17 @@ BAND_COLUMNS = {
     "500-1k": "band_500_1k",
     "1k-2k": "band_1k_2k",
     "200-1200": "band_200_1200",
+    "500-1k_std": "band_500_1k_std",
+    "1k-2k_std": "band_1k_2k_std",
+    "spectral_flux": "spectral_flux",
+    "spectral_flatness": "spectral_flatness",
+}
+
+HISTORY_ADDITIONS = {
+    "band_500_1k_std": "REAL",
+    "band_1k_2k_std": "REAL",
+    "spectral_flux": "REAL",
+    "spectral_flatness": "REAL",
 }
 
 # stream_connected is gone: rows are only written while audio is
@@ -61,6 +72,10 @@ CREATE TABLE IF NOT EXISTS history (
     band_500_1k      REAL,
     band_1k_2k       REAL,
     band_200_1200    REAL,
+    band_500_1k_std  REAL,
+    band_1k_2k_std   REAL,
+    spectral_flux    REAL,
+    spectral_flatness REAL,
     stream_connected INTEGER,
     lost_frames      INTEGER,
     device_dropped   INTEGER
@@ -128,6 +143,16 @@ class HistoryStore:
             # WAL so a long read cannot block the once-a-second write.
             self.connection.execute("PRAGMA journal_mode=WAL")
             self.connection.executescript(SCHEMA)
+            existing = {
+                row[1] for row in self.connection.execute(
+                    "PRAGMA table_info(history)"
+                )
+            }
+            for column, sql_type in HISTORY_ADDITIONS.items():
+                if column not in existing:
+                    self.connection.execute(
+                        f"ALTER TABLE history ADD COLUMN {column} {sql_type}"
+                    )
             self.connection.commit()
 
         self.last_written = 0.0
@@ -158,7 +183,15 @@ class HistoryStore:
             round(snapshot.stable_seconds, 2),
             round(features.get("rms", -120.0), 2),
             *[
-                round(features.get(band, -120.0), 2)
+                round(
+                    features.get(
+                        band,
+                        -120.0 if band in {
+                            "30-80", "500-1k", "1k-2k", "200-1200"
+                        } else 0.0,
+                    ),
+                    4,
+                )
                 for band in BAND_COLUMNS
             ],
             health.lost_frames,

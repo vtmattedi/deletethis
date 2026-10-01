@@ -44,6 +44,15 @@ import numpy as np
 from scipy.io import wavfile
 from scipy.signal import spectrogram
 
+from acstream import FULL_SCALE
+from features import (
+    BANDS,
+    DB_FLOOR,
+    FEATURE_NAMES as SHARED_FEATURE_NAMES,
+    FeatureExtractor,
+    power_to_db,
+)
+
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_RECORDINGS = HERE / "recordings"
@@ -57,11 +66,6 @@ DEFAULT_FEATURES_CSV = DEFAULT_RESULTS / "features.csv"
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_NFFT = 1024
 
-DB_FLOOR = -120.0
-
-PEAK_MIN_HZ = 100.0
-PEAK_MAX_HZ = 4000.0
-
 STATE_ORDER = ["off", "fan", "compressor"]
 KNOWN_STATES = set(STATE_ORDER)
 
@@ -72,21 +76,6 @@ NUMBER_PATTERN = re.compile(r"^\d+$")
 # ---------------------------------------------------------------------
 # Spectral features
 # ---------------------------------------------------------------------
-
-# Original exploratory bands.
-BANDS: list[tuple[str, float, float]] = [
-    ("30-80", 30.0, 80.0),
-    ("80-200", 80.0, 200.0),
-    ("200-500", 200.0, 500.0),
-    ("500-1k", 500.0, 1000.0),
-    ("1k-2k", 1000.0, 2000.0),
-    ("2k-4k", 2000.0, 4000.0),
-    ("1100-1200", 1100.0, 1200.0),
-
-    # Derived classifier-oriented bands.
-    ("200-1200", 200.0, 1200.0),
-    ("1500-4000", 1500.0, 4000.0),
-]
 
 # high/mech is expressed in dB:
 #
@@ -196,51 +185,6 @@ def to_float(samples: np.ndarray) -> np.ndarray:
     )
 
 
-def power_to_db(
-    power: np.ndarray | float,
-) -> np.ndarray | float:
-    """Mean-square power -> dBFS."""
-
-    amplitude = np.sqrt(
-        np.maximum(power, 0.0)
-    )
-
-    return np.maximum(
-        20.0
-        * np.log10(
-            np.maximum(amplitude, 1e-12)
-        ),
-        DB_FLOOR,
-    )
-
-
-def frame_signal(
-    signal: np.ndarray,
-    nperseg: int,
-    noverlap: int,
-) -> np.ndarray:
-    """Create windows aligned with scipy.signal.spectrogram."""
-
-    step = nperseg - noverlap
-
-    count = (
-        1
-        + (signal.size - nperseg) // step
-    )
-
-    offsets = (
-        step
-        * np.arange(count)[:, None]
-    )
-
-    indexes = (
-        offsets
-        + np.arange(nperseg)[None, :]
-    )
-
-    return signal[indexes]
-
-
 # ---------------------------------------------------------------------
 # Analysis object
 # ---------------------------------------------------------------------
@@ -263,6 +207,7 @@ class Analysis:
     band_db: dict[str, np.ndarray]
 
     peak_hz: np.ndarray
+    feature_values: dict[str, np.ndarray]
 
     @property
     def condition(self) -> str:
@@ -283,6 +228,9 @@ class Analysis:
                 self.band_db["1500-4000"]
                 - self.band_db["200-1200"]
             )
+
+        if name in self.feature_values:
+            return self.feature_values[name]
 
         return self.band_db[name]
 
@@ -334,94 +282,24 @@ def analyse_file(
         mode="psd",
     )
 
-    # ----------------------------------------------------------
-    # True time-domain RMS.
-    # ----------------------------------------------------------
-
-    windows = frame_signal(
-        signal,
-        nfft,
-        noverlap,
-    )
-
-    windows = (
-        windows
-        - windows.mean(
-            axis=1,
-            keepdims=True,
-        )
-    )
-
-    rms_db = power_to_db(
-        np.mean(
-            windows * windows,
-            axis=1,
-        )
-    )
-
-    if rms_db.size != times.size:
+    # All dataset values come from the exact extractor used live.
+    extractor = FeatureExtractor(sample_rate, nfft, overlap)
+    shared = extractor.push(signal * FULL_SCALE)
+    if len(shared) != times.size:
         raise ValueError(
-            f"{path.name}: framing mismatch: "
-            f"{rms_db.size} RMS windows vs "
-            f"{times.size} spectral windows"
+            f"{path.name}: framing mismatch: {len(shared)} shared "
+            f"windows vs {times.size} spectral windows"
         )
-
-    # ----------------------------------------------------------
-    # Spectral band power.
-    # ----------------------------------------------------------
-
-    band_db: dict[
-        str,
-        np.ndarray
-    ] = {}
-
-    for name, low, high in BANDS:
-        mask = (
-            (freqs >= low)
-            & (freqs < high)
-        )
-
-        if not mask.any():
-            band_db[name] = np.full(
-                times.shape,
-                DB_FLOOR,
-            )
-
-            continue
-
-        band_power = power[
-            mask,
-            :
-        ].sum(axis=0)
-
-        band_db[name] = power_to_db(
-            band_power
-        )
-
-    # ----------------------------------------------------------
-    # Dominant peak.
-    # ----------------------------------------------------------
-
-    peak_mask = (
-        (freqs >= PEAK_MIN_HZ)
-        & (freqs <= PEAK_MAX_HZ)
-    )
-
-    peak_freqs = freqs[peak_mask]
-
-    if peak_freqs.size:
-        peak_indexes = np.argmax(
-            power[peak_mask, :],
-            axis=0,
-        )
-
-        peak_hz = peak_freqs[
-            peak_indexes
-        ]
-    else:
-        peak_hz = np.zeros(
-            times.shape
-        )
+    feature_values = {
+        name: np.array([row.values[name] for row in shared])
+        for name in SHARED_FEATURE_NAMES
+    }
+    rms_db = feature_values["rms"]
+    band_db = {
+        name: feature_values[name]
+        for name, _, _ in BANDS
+    }
+    peak_hz = feature_values["peak_hz"]
 
     return Analysis(
         path=path,
@@ -443,6 +321,7 @@ def analyse_file(
         band_db=band_db,
 
         peak_hz=peak_hz,
+        feature_values=feature_values,
     )
 
 
@@ -1058,6 +937,97 @@ def stability_table(
 
 
 # ---------------------------------------------------------------------
+# FAN vs OFF/noise ranking
+# ---------------------------------------------------------------------
+
+def _recording_feature_values(
+    analyses: list[Analysis], feature: str
+) -> np.ndarray:
+    """One median per recording, so long files cannot dominate."""
+    return np.array([
+        float(np.median(analysis.feature(feature)))
+        for analysis in analyses
+    ])
+
+
+def _roc_auc(positive: np.ndarray, negative: np.ndarray) -> float:
+    """Probability that a random positive ranks above a negative."""
+    comparisons = positive[:, None] - negative[None, :]
+    return float(
+        (np.count_nonzero(comparisons > 0)
+         + 0.5 * np.count_nonzero(comparisons == 0))
+        / comparisons.size
+    )
+
+
+def fan_separation_report(analyses: list[Analysis]) -> str:
+    fan = [analysis for analysis in analyses if analysis.state == "fan"]
+    off = [analysis for analysis in analyses if analysis.state == "off"]
+    if not fan or not off:
+        return "(need at least one FAN and one OFF recording)"
+
+    def conditions(group: list[Analysis]) -> str:
+        counts: dict[str, int] = {}
+        for analysis in group:
+            counts[analysis.interference] = (
+                counts.get(analysis.interference, 0) + 1
+            )
+        return ", ".join(
+            f"{name} ({count})" for name, count in sorted(counts.items())
+        )
+
+    rows = []
+    for feature in SHARED_FEATURE_NAMES:
+        positive = _recording_feature_values(fan, feature)
+        negative = _recording_feature_values(off, feature)
+        fan_median = float(np.median(positive))
+        off_median = float(np.median(negative))
+        fan_p10, fan_p90 = np.percentile(positive, [10, 90])
+        off_p10, off_p90 = np.percentile(negative, [10, 90])
+        auc = _roc_auc(positive, negative)
+
+        if fan_median >= off_median:
+            margin = float(fan_p10 - off_p90)
+            direction = "FAN higher"
+        else:
+            margin = float(off_p10 - fan_p90)
+            direction = "FAN lower"
+        indication = (
+            f"separated {margin:+.3g}, {direction}"
+            if margin > 0
+            else f"overlap {abs(margin):.3g}, {direction}"
+        )
+        rows.append((
+            abs(auc - 0.5),
+            [
+                feature,
+                f"{fan_median:.4g}",
+                f"{fan_p10:.4g}/{fan_p90:.4g}",
+                f"{off_median:.4g}",
+                f"{off_p10:.4g}/{off_p90:.4g}",
+                f"{auc:.3f}",
+                indication,
+            ],
+        ))
+
+    rows.sort(key=lambda item: item[0], reverse=True)
+    table = format_table(
+        [row for _, row in rows],
+        [
+            "Feature", "FAN median", "FAN P10/P90",
+            "OFF median", "OFF P10/P90", "ROC AUC", "indication",
+        ],
+    )
+    return (
+        f"FAN recordings: {conditions(fan)}\n"
+        f"OFF/noise recordings: {conditions(off)}\n"
+        "Each observation is one recording median; no adjacent windows "
+        "are split or independently weighted.\n\n"
+        + table
+    )
+
+
+# ---------------------------------------------------------------------
 # CSV
 # ---------------------------------------------------------------------
 
@@ -1071,7 +1041,7 @@ def write_csv(
         exist_ok=True,
     )
 
-    feature_names = FEATURES
+    feature_names = SHARED_FEATURE_NAMES
 
     with path.open(
         "w",
@@ -1090,7 +1060,6 @@ def write_csv(
                 "t",
             ]
             + feature_names
-            + ["peak_hz"]
         )
 
         for analysis in analyses:
@@ -1106,12 +1075,9 @@ def write_csv(
                         f"{time:.3f}",
                     ]
                     + [
-                        f"{analysis.feature(feature)[index]:.2f}"
+                        f"{analysis.feature(feature)[index]:.6g}"
                         for feature
                         in feature_names
-                    ]
-                    + [
-                        f"{analysis.peak_hz[index]:.1f}"
                     ]
                 )
 
@@ -1441,6 +1407,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--fan-separation",
+        action="store_true",
+        help=(
+            "Rank shared features for FAN vs OFF/noise using one "
+            "observation per recording; does not choose thresholds"
+        ),
+    )
+
     return parser
 
 
@@ -1686,6 +1661,13 @@ def main(
             args.stability_seconds,
         )
     )
+
+    if args.fan_separation:
+        print()
+        print("FAN vs OFF/noise feature separation")
+        print("ROC AUC is directional: 1 means FAN is higher; 0 lower.")
+        print()
+        print(fan_separation_report(analyses))
 
     if args.csv:
         write_csv(

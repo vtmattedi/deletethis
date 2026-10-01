@@ -14,6 +14,7 @@ import numpy as np
 
 from classify_live import (
     DIAGNOSTIC_BANDS,
+    FEATURE_NAMES,
     RULE_BANDS,
     Decision,
     FeatureExtractor,
@@ -42,7 +43,7 @@ class Snapshot:
             "candidate": self.candidate,
             "stableSeconds": round(self.stable_seconds, 2),
             "features": {
-                name: round(value, 1)
+                name: round(value, 4)
                 for name, value in self.features.items()
             },
             "streamSeconds": round(self.stream_time, 2),
@@ -79,8 +80,8 @@ class ClassifierService:
             state=None,
             candidate=None,
             stable_seconds=0.0,
-            features={name: -120.0 for name in BAND_NAMES}
-            | {"rms": -120.0},
+            features={name: 0.0 for name in FEATURE_NAMES}
+            | {name: -120.0 for name in ["rms", *BAND_NAMES]},
             stream_time=0.0,
         )
 
@@ -113,7 +114,8 @@ class ClassifierService:
                     state=decision.state,
                     candidate=decision.candidate,
                     stable_seconds=decision.stable_seconds,
-                    features=dict(decision.smoothed)
+                    features=features.values
+                    | dict(decision.smoothed)
                     | {"rms": decision.rms_db},
                     stream_time=features.time,
                 )
@@ -168,17 +170,17 @@ class ClassifierService:
 
         summary: dict[str, dict[str, float]] = {}
 
-        for name in BAND_NAMES:
+        for name in FEATURE_NAMES:
             values = np.array(
-                [item.bands[name] for item in history],
+                [item.values[name] for item in history],
                 dtype=np.float64,
             )
 
             summary[name] = {
-                "median": round(float(np.median(values)), 2),
-                "std": round(float(np.std(values)), 2),
-                "min": round(float(values.min()), 2),
-                "max": round(float(values.max()), 2),
+                "median": round(float(np.median(values)), 6),
+                "std": round(float(np.std(values)), 6),
+                "min": round(float(values.min()), 6),
+                "max": round(float(values.max()), 6),
             }
 
         return summary

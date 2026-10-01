@@ -73,13 +73,10 @@ def event_timeline(
     from acstream import FULL_SCALE
     from analyze import to_float
     from classify_live import (
-        DIAGNOSTIC_BANDS,
-        RULE_BANDS,
+        FEATURE_NAMES,
         FeatureExtractor,
         Smoother,
     )
-
-    bands = RULE_BANDS + DIAGNOSTIC_BANDS
 
     sample_rate, raw = wavfile.read(wav_path)
 
@@ -98,10 +95,9 @@ def event_timeline(
         "t": [],
         "state": [],
         "candidate": [],
-        "rms": [],
     }
 
-    for name in bands:
+    for name in FEATURE_NAMES:
         columns[name] = []
 
     chunk = 512
@@ -115,12 +111,15 @@ def event_timeline(
             )
             columns["state"].append(decision.state)
             columns["candidate"].append(decision.candidate)
-            columns["rms"].append(round(decision.rms_db, 2))
-
-            for name in bands:
-                columns[name].append(
-                    round(decision.smoothed[name], 2)
+            values = features.values
+            for name in FEATURE_NAMES:
+                value = (
+                    decision.rms_db if name == "rms"
+                    else decision.smoothed[name]
+                    if name in decision.smoothed
+                    else values[name]
                 )
+                columns[name].append(round(value, 6))
 
     return {
         "sampleRate": sample_rate,
@@ -386,7 +385,7 @@ class EventRecorder:
                 ),
             },
             "featuresAtTransition": {
-                name: round(value, 1)
+                name: round(value, 6)
                 for name, value in event.features.items()
             },
             "decisionWindow": event.decision_window,
