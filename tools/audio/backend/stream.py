@@ -26,6 +26,11 @@ from .events import EventRecorder
 from .history import HistoryStore
 
 RECONNECT_DELAY_SECONDS = 2.0
+# A missing frame or two is common on this stream and only represents
+# tens of milliseconds. Reset the feature windows/pre-roll for those
+# holes, but keep the last published state so the next genuine state
+# change is still recorded. Larger holes are treated like reconnects.
+CONTINUITY_BREAK_GAP_SECONDS = 0.25
 
 
 @dataclass
@@ -318,11 +323,14 @@ class StreamService(threading.Thread):
         assert self.classifier is not None
         assert self.events is not None
 
-        self.classifier.reset(
-            skip_samples=lost * info.frame_samples
-        )
+        gap_seconds = lost * info.frame_samples / info.sample_rate
+
+        self.classifier.reset(skip_samples=lost * info.frame_samples)
         self.events.discard_history()
-        self._break_continuity()
+
+        continuity_broken = gap_seconds > CONTINUITY_BREAK_GAP_SECONDS
+        if continuity_broken:
+            self._break_continuity()
 
         self.history.record_connection(
             False,
@@ -334,8 +342,12 @@ class StreamService(threading.Thread):
 
         print(
             f"stream: gap of {lost} frame(s), "
-            f"{lost * info.frame_samples / info.sample_rate * 1000:.0f}"
-            " ms; history reset"
+            f"{gap_seconds * 1000:.0f} ms; "
+            + (
+                "history and transition baseline reset"
+                if continuity_broken
+                else "history reset; transition tracking preserved"
+            )
         )
 
         return now_missing

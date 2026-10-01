@@ -2,6 +2,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 
@@ -32,6 +34,44 @@ class LiveAudioTests(unittest.TestCase):
         self.assertEqual(len(received), 1)
         decoded = np.frombuffer(received[0], dtype="<i4")
         np.testing.assert_array_equal(decoded, samples)
+
+    def test_short_gap_preserves_transition_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = StreamService(AppConfig(
+                history_path=root / "history.db",
+                events_dir=root / "events",
+            ))
+            service.classifier = Mock()
+            service._previous_state = "FAN"
+            stream = SimpleNamespace(lost_frames=2, dropped_frames=0)
+            info = SimpleNamespace(sample_rate=16000, frame_samples=512)
+
+            missing = service._check_gap(stream, info, 0)
+
+            self.assertEqual(missing, 2)
+            self.assertEqual(service._previous_state, "FAN")
+            service.classifier.reset.assert_called_once_with(
+                skip_samples=1024
+            )
+            service.close()
+
+    def test_large_gap_forgets_transition_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = StreamService(AppConfig(
+                history_path=root / "history.db",
+                events_dir=root / "events",
+            ))
+            service.classifier = Mock()
+            service._previous_state = "FAN"
+            stream = SimpleNamespace(lost_frames=10, dropped_frames=0)
+            info = SimpleNamespace(sample_rate=16000, frame_samples=512)
+
+            service._check_gap(stream, info, 0)
+
+            self.assertIsNone(service._previous_state)
+            service.close()
 
 
 if __name__ == "__main__":

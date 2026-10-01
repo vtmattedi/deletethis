@@ -406,7 +406,13 @@ function render(data) {
 
   if (data.config) applyConfig(data.config);
 
-  const written = (data.events || {}).written;
+  const eventStatus = data.events || {};
+  const pending = eventStatus.pending || 0;
+  $("eventCaptureStatus").textContent = pending
+    ? `${pending} capture${pending === 1 ? "" : "s"} finishing post-roll…`
+    : "";
+
+  const written = eventStatus.written;
   if (written != null && written !== lastEventCount) {
     lastEventCount = written;
     loadEvents();
