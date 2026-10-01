@@ -72,11 +72,8 @@ def event_timeline(
 
     from acstream import FULL_SCALE
     from analyze import to_float
-    from classify_live import (
-        FEATURE_NAMES,
-        FeatureExtractor,
-        Smoother,
-    )
+    from classifier.common import Smoother
+    from features import FEATURE_NAMES, FeatureExtractor
 
     sample_rate, raw = wavfile.read(wav_path)
 
@@ -85,7 +82,7 @@ def event_timeline(
     extractor = FeatureExtractor(sample_rate, nfft, overlap)
 
     smoother = Smoother(
-        config.thresholds(),
+        config.rule(),
         window_rate=sample_rate / extractor.hop,
         median_seconds=config.median_seconds,
         hold_seconds=config.hold_seconds,
@@ -111,17 +108,13 @@ def event_timeline(
             )
             columns["state"].append(decision.state)
             columns["candidate"].append(decision.candidate)
-            values = features.values
+            # The values the rule decided from, so the picture shows
+            # the same smoothed inputs the classifier used.
             for name in FEATURE_NAMES:
-                value = (
-                    decision.rms_db if name == "rms"
-                    else decision.smoothed[name]
-                    if name in decision.smoothed
-                    else values[name]
-                )
-                columns[name].append(round(value, 6))
+                columns[name].append(round(decision.values[name], 6))
 
     return {
+        "classifierVersion": config.version,
         "sampleRate": sample_rate,
         "nfft": nfft,
         "overlap": overlap,
@@ -367,6 +360,12 @@ class EventRecorder:
 
         metadata = {
             "id": event.identifier,
+            # Which classifier produced this event's from/to, and under
+            # which settings. Events recorded before versions existed
+            # carry neither key and were all classified by v1.
+            "classifierVersion": event.classifier_config.get(
+                "classifierVersion", "v1"
+            ),
             "time": event.started.isoformat(timespec="seconds"),
             "from": event.from_state,
             "to": event.to_state,

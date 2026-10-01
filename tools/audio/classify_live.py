@@ -77,185 +77,100 @@ from features import (  # noqa: E402
     Features,
 )
 
-# The states this classifier can report, in escalation order.
-OFF = "OFF"
-FAN = "FAN"
-COMPRESSOR = "COMPRESSOR"
+# The rules, the Smoother and the states live in the classifier package
+# so that every consumer -- this CLI, the backend, event timelines and
+# the evaluator -- drives the same implementation. The names below are
+# re-exported because they used to be defined here.
+from classifier import (  # noqa: E402
+    COMPRESSOR,
+    DEFAULT_HOLD_SECONDS,
+    DEFAULT_MEDIAN_SECONDS,
+    FAN,
+    OFF,
+    VERSIONS,
+    Decision,
+    Smoother,
+)
+from classifier.v1 import (  # noqa: E402
+    DEFAULT_COMPRESSOR_THRESHOLD,
+    DEFAULT_FAN_HIGH_THRESHOLD,
+    DEFAULT_FAN_MID_THRESHOLD,
+    DEFAULT_FAN_REQUIRE,
+    Thresholds,
+    classify,
+)
 
-# Measured against the 18 labelled recordings with --replay. See the
-# module docstring for what the numbers are worth and where they fail.
-#
-# COMPRESSOR has an enormous margin: 30-80 sits at -38 dB when the
-# compressor runs and at -57..-59 dB in every other condition, so -48
-# is 10 dB clear of both sides.
-#
-# FAN is far tighter. The fan's own 1k-2k level is about -63.7 dB, and
-# speech with the AC off reaches -58 dB in peaks, so the usable window
-# for the high threshold is only -66..-64 and -65 is its centre. Both
-# fan bands must be over threshold, which is what separates a fan from
-# someone talking; either-of-two cannot get past 93%.
-DEFAULT_COMPRESSOR_THRESHOLD = -48.0
-DEFAULT_FAN_MID_THRESHOLD = -62.0
-DEFAULT_FAN_HIGH_THRESHOLD = -65.0
-DEFAULT_FAN_REQUIRE = "both"
+from classifier import v2 as rules_v2  # noqa: E402
+from classifier.v2 import STABILITY_FEATURES, ThresholdsV2  # noqa: E402
 
-DEFAULT_HOLD_SECONDS = 2.0
-DEFAULT_MEDIAN_SECONDS = 0.5
 DEFAULT_REFRESH_HZ = 5.0
 
-
-# ---------------------------------------------------------------------
-# Rules
-# ---------------------------------------------------------------------
-
-
-@dataclass
-class Thresholds:
-    compressor: float = DEFAULT_COMPRESSOR_THRESHOLD
-    fan_mid: float = DEFAULT_FAN_MID_THRESHOLD
-    fan_high: float = DEFAULT_FAN_HIGH_THRESHOLD
-    fan_require_both: bool = False
-
-
-def classify(
-    bands: dict[str, float],
-    thresholds: Thresholds,
-) -> str:
-    """Hierarchical rules over already-smoothed band levels."""
-
-    # Stage 1. The compressor is the only thing in a room that puts
-    # sustained energy this low, so it is tested first and wins
-    # outright.
-    if bands["30-80"] >= thresholds.compressor:
-        return COMPRESSOR
-
-    # Stage 2. Airflow is broadband and sits in the mid and upper mids.
-    mid = bands["500-1k"] >= thresholds.fan_mid
-    high = bands["1k-2k"] >= thresholds.fan_high
-
-    if thresholds.fan_require_both:
-        return FAN if (mid and high) else OFF
-
-    return FAN if (mid or high) else OFF
+# Threshold defaults per classifier version. The two differ on
+# purpose: v2 carries the compressor threshold the live system
+# actually runs at (see classifier/v2.py).
+VERSION_DEFAULTS = {
+    "v1": {
+        "compressor_threshold": DEFAULT_COMPRESSOR_THRESHOLD,
+        "fan_mid_threshold": DEFAULT_FAN_MID_THRESHOLD,
+        "fan_high_threshold": DEFAULT_FAN_HIGH_THRESHOLD,
+        "fan_require": DEFAULT_FAN_REQUIRE,
+    },
+    "v2": {
+        "compressor_threshold": rules_v2.DEFAULT_COMPRESSOR_THRESHOLD,
+        "fan_mid_threshold": rules_v2.DEFAULT_FAN_MID_THRESHOLD,
+        "fan_high_threshold": rules_v2.DEFAULT_FAN_HIGH_THRESHOLD,
+        "fan_require": rules_v2.DEFAULT_FAN_REQUIRE,
+    },
+}
 
 
-# ---------------------------------------------------------------------
-# Temporal smoothing
-# ---------------------------------------------------------------------
+def resolve_defaults(args):
+    """Fill threshold flags the user left out with the version's own."""
+    for name, value in VERSION_DEFAULTS[args.classifier].items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+
+    return args
 
 
-@dataclass
-class Decision:
-    candidate: str
-    stable_seconds: float
-    state: str | None
-    changed: bool
-    smoothed: dict[str, float]
-    rms_db: float
-
-
-class Smoother:
-    """Rolling median of features, then a hold before publishing.
-
-    Two separate mechanisms, doing two different jobs:
-
-    * the median over ``median_seconds`` removes single-window spikes,
-      so one loud transient cannot move the candidate at all;
-    * the hold over ``hold_seconds`` means a candidate has to persist
-      before it is published, so a genuinely new but short-lived sound
-      (someone talking near the mic) never becomes a reported state.
-    """
-
-    def __init__(
-        self,
-        thresholds: Thresholds,
-        window_rate: float,
-        median_seconds: float = DEFAULT_MEDIAN_SECONDS,
-        hold_seconds: float = DEFAULT_HOLD_SECONDS,
-        history_seconds: float = 2.0,
-    ) -> None:
-        self.thresholds = thresholds
-        self.hold_seconds = hold_seconds
-
-        median_windows = max(1, round(median_seconds * window_rate))
-
-        self.history: deque[Features] = deque(
-            maxlen=max(
-                median_windows,
-                round(history_seconds * window_rate),
-            )
+def build_rule(args):
+    """The decision rule for the chosen classifier version."""
+    if args.classifier == "v2":
+        return ThresholdsV2(
+            compressor=args.compressor_threshold,
+            fan_mid=args.fan_mid_threshold,
+            fan_high=args.fan_high_threshold,
+            fan_require_both=args.fan_require == "both",
+            stability_feature=args.fan_stability_feature,
+            stability_threshold=args.fan_stability_threshold,
+            stability_min_seconds=args.fan_stability_min_seconds,
         )
 
-        self.median_windows = median_windows
+    return Thresholds(
+        compressor=args.compressor_threshold,
+        fan_mid=args.fan_mid_threshold,
+        fan_high=args.fan_high_threshold,
+        fan_require_both=args.fan_require == "both",
+    )
 
-        self.candidate: str | None = None
-        self.candidate_since = 0.0
-        self.state: str | None = None
 
-    def reset(self) -> None:
-        """Forget the feature history after a gap in the audio.
+def describe_rule(args):
+    """Human-readable lines for the rule in force."""
+    lines = [
+        f"COMPRESSOR if 30-80 >= {args.compressor_threshold:g} dB",
+        f"FAN if 500-1k >= {args.fan_mid_threshold:g} "
+        f"{'and' if args.fan_require == 'both' else 'or'} "
+        f"1k-2k >= {args.fan_high_threshold:g} dB",
+    ]
 
-        The published state is kept: it is the last thing actually
-        observed, and a dropout is not evidence that it changed. But
-        the candidate has to re-earn its hold, so nothing is published
-        on the strength of medians taken across a discontinuity.
-        """
-        self.history.clear()
-        self.candidate = None
-        self.candidate_since = 0.0
-
-    def update(self, features: Features) -> Decision:
-        self.history.append(features)
-
-        recent = list(self.history)[-self.median_windows :]
-
-        smoothed = {
-            name: float(
-                np.median([item.bands[name] for item in recent])
-            )
-            for name in features.bands
-        }
-
-        rms_db = float(
-            np.median([item.rms_db for item in recent])
+    if args.classifier == "v2":
+        lines.append(
+            f"    and {args.fan_stability_feature} <= "
+            f"{args.fan_stability_threshold:g} dB "
+            f"(needs {args.fan_stability_min_seconds:g}s of history)"
         )
 
-        candidate = classify(smoothed, self.thresholds)
-
-        if candidate != self.candidate:
-            self.candidate = candidate
-            self.candidate_since = features.time
-
-        stable = features.time - self.candidate_since
-
-        changed = False
-
-        if candidate != self.state and stable >= self.hold_seconds:
-            self.state = candidate
-            changed = True
-
-        return Decision(
-            candidate=candidate,
-            stable_seconds=stable,
-            state=self.state,
-            changed=changed,
-            smoothed=smoothed,
-            rms_db=rms_db,
-        )
-
-    def band_spread(self, name: str) -> float:
-        """Standard deviation of a band over the kept history.
-
-        A compressor is steady, so a high spread in 30-80 alongside a
-        high level is a hint that something transient is being read as
-        one.
-        """
-        if len(self.history) < 2:
-            return 0.0
-
-        return float(
-            np.std([item.bands[name] for item in self.history])
-        )
+    return lines
 
 
 # ---------------------------------------------------------------------
@@ -605,12 +520,7 @@ def run_replay(args: argparse.Namespace) -> int:
         )
         return 1
 
-    thresholds = Thresholds(
-        compressor=args.compressor_threshold,
-        fan_mid=args.fan_mid_threshold,
-        fan_high=args.fan_high_threshold,
-        fan_require_both=args.fan_require == "both",
-    )
+    thresholds = build_rule(args)
 
     results: list[ReplayResult] = []
 
@@ -635,15 +545,11 @@ def run_replay(args: argparse.Namespace) -> int:
         f"Replaying the live classifier over {len(results)} recording(s)"
     )
     print()
-    print(
-        f"Rules:  COMPRESSOR if 30-80 >= "
-        f"{args.compressor_threshold:g}"
-    )
-    print(
-        f"        FAN if 500-1k >= {args.fan_mid_threshold:g} "
-        f"{'and' if args.fan_require == 'both' else 'or'} "
-        f"1k-2k >= {args.fan_high_threshold:g}"
-    )
+    print(f"Classifier: {args.classifier}")
+    first, *rest = describe_rule(args)
+    print(f"Rules:  {first}")
+    for line in rest:
+        print(f"        {line}")
     print(
         f"Smooth: {args.median_seconds:g}s median, "
         f"{args.hold_seconds:g}s hold"
@@ -767,48 +673,100 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Window overlap (default: {DEFAULT_OVERLAP})",
     )
 
-    thresholds = parser.add_argument_group("thresholds (dBFS)")
+    parser.add_argument(
+        "--classifier",
+        choices=VERSIONS,
+        default="v1",
+        help=(
+            "Classifier version: v1 thresholds, or v2 with a "
+            "stationarity gate on FAN (default: v1, the behaviour "
+            "this tool always had)"
+        ),
+    )
+
+    thresholds = parser.add_argument_group(
+        "thresholds (dBFS); defaults depend on --classifier"
+    )
 
     thresholds.add_argument(
         "--compressor-threshold",
         type=float,
-        default=DEFAULT_COMPRESSOR_THRESHOLD,
+        default=None,
         help=(
             "30-80 Hz level at or above which the state is COMPRESSOR "
-            f"(default: {DEFAULT_COMPRESSOR_THRESHOLD:g})"
+            f"(v1: {DEFAULT_COMPRESSOR_THRESHOLD:g}, "
+            f"v2: {rules_v2.DEFAULT_COMPRESSOR_THRESHOLD:g})"
         ),
     )
 
     thresholds.add_argument(
         "--fan-mid-threshold",
         type=float,
-        default=DEFAULT_FAN_MID_THRESHOLD,
+        default=None,
         help=(
             "500-1k Hz level counting towards FAN "
-            f"(default: {DEFAULT_FAN_MID_THRESHOLD:g})"
+            f"(v1: {DEFAULT_FAN_MID_THRESHOLD:g}, "
+            f"v2: {rules_v2.DEFAULT_FAN_MID_THRESHOLD:g})"
         ),
     )
 
     thresholds.add_argument(
         "--fan-high-threshold",
         type=float,
-        default=DEFAULT_FAN_HIGH_THRESHOLD,
+        default=None,
         help=(
             "1k-2k Hz level counting towards FAN "
-            f"(default: {DEFAULT_FAN_HIGH_THRESHOLD:g})"
+            f"(v1: {DEFAULT_FAN_HIGH_THRESHOLD:g}, "
+            f"v2: {rules_v2.DEFAULT_FAN_HIGH_THRESHOLD:g})"
         ),
     )
 
     thresholds.add_argument(
         "--fan-require",
         choices=["either", "both"],
-        default=DEFAULT_FAN_REQUIRE,
+        default=None,
         help=(
             "Whether one or both fan bands must be over threshold "
             # argparse runs help text through %-expansion, so a literal
             # per cent sign has to be doubled.
             f"(default: {DEFAULT_FAN_REQUIRE}; 'either' cannot get "
             "past 93%% on the recorded data)"
+        ),
+    )
+
+    stability = parser.add_argument_group(
+        "fan stationarity gate (--classifier v2 only)"
+    )
+
+    stability.add_argument(
+        "--fan-stability-feature",
+        choices=STABILITY_FEATURES,
+        default=rules_v2.DEFAULT_FAN_STABILITY_FEATURE,
+        help=(
+            "Temporal feature that must stay small for FAN "
+            f"(default: {rules_v2.DEFAULT_FAN_STABILITY_FEATURE})"
+        ),
+    )
+
+    stability.add_argument(
+        "--fan-stability-threshold",
+        type=float,
+        default=rules_v2.DEFAULT_FAN_STABILITY_THRESHOLD,
+        help=(
+            "Largest value of that feature still read as a steady "
+            f"fan, in dB (default: "
+            f"{rules_v2.DEFAULT_FAN_STABILITY_THRESHOLD:g})"
+        ),
+    )
+
+    stability.add_argument(
+        "--fan-stability-min-seconds",
+        type=float,
+        default=rules_v2.DEFAULT_FAN_STABILITY_MIN_SECONDS,
+        help=(
+            "History the feature needs before the gate trusts it "
+            f"(default: "
+            f"{rules_v2.DEFAULT_FAN_STABILITY_MIN_SECONDS:g})"
         ),
     )
 
@@ -879,15 +837,11 @@ def print_settings(args: argparse.Namespace, window_rate: float) -> None:
         f"{args.overlap:.0%} overlap, Hamming, "
         f"{window_rate:.1f}/s"
     )
-    print(
-        f"Rules:   COMPRESSOR if 30-80 >= "
-        f"{args.compressor_threshold:g} dB"
-    )
-    print(
-        f"         FAN if 500-1k >= {args.fan_mid_threshold:g} "
-        f"{'and' if args.fan_require == 'both' else 'or'} "
-        f"1k-2k >= {args.fan_high_threshold:g} dB"
-    )
+    print(f"Classifier: {args.classifier}")
+    first, *rest = describe_rule(args)
+    print(f"Rules:   {first}")
+    for line in rest:
+        print(f"         {line}")
     print(
         f"Smooth:  {args.median_seconds:g}s median, "
         f"{args.hold_seconds:g}s hold before publishing"
@@ -931,12 +885,7 @@ def run(args: argparse.Namespace) -> int:
 
     print_settings(args, window_rate)
 
-    thresholds = Thresholds(
-        compressor=args.compressor_threshold,
-        fan_mid=args.fan_mid_threshold,
-        fan_high=args.fan_high_threshold,
-        fan_require_both=args.fan_require == "both",
-    )
+    thresholds = build_rule(args)
 
     smoother = Smoother(
         thresholds,
@@ -1063,7 +1012,7 @@ def run(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = resolve_defaults(parser.parse_args(argv))
 
     if args.list_ports:
         ports = list_ports()

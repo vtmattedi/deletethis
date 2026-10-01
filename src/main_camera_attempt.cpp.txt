@@ -1,0 +1,236 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <cstring>
+#include "esp_camera.h"
+#include "esp_http_server.h"
+
+#if __has_include("creds.h")
+#include "creds.h"
+#else
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#endif
+
+// AI-Thinker ESP32-CAM pin map.
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
+
+namespace
+{
+constexpr uint32_t serialBaud = 115200;
+constexpr uint32_t wifiConnectTimeoutMs = 20000;
+
+constexpr char streamContentType[] =
+    "multipart/x-mixed-replace;boundary="
+    "123456789000000000000987654321";
+constexpr char streamDelimiter[] =
+    "\r\n--123456789000000000000987654321\r\n";
+constexpr char streamPartHeader[] =
+    "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+httpd_handle_t cameraServer = nullptr;
+
+esp_err_t streamCamera(httpd_req_t *request)
+{
+    esp_err_t result = httpd_resp_set_type(request, streamContentType);
+
+    if (result != ESP_OK)
+        return result;
+
+    httpd_resp_set_hdr(request, "Access-Control-Allow-Origin", "*");
+
+    while (result == ESP_OK)
+    {
+        camera_fb_t *frame = esp_camera_fb_get();
+
+        if (frame == nullptr)
+        {
+            Serial.println("Camera capture failed.");
+            return ESP_FAIL;
+        }
+
+        char partHeader[64];
+        const int headerLength = snprintf(
+            partHeader,
+            sizeof(partHeader),
+            streamPartHeader,
+            static_cast<unsigned>(frame->len)
+        );
+
+        if (headerLength < 0 ||
+            static_cast<size_t>(headerLength) >= sizeof(partHeader))
+        {
+            esp_camera_fb_return(frame);
+            return ESP_FAIL;
+        }
+
+        result = httpd_resp_send_chunk(
+            request,
+            streamDelimiter,
+            sizeof(streamDelimiter) - 1
+        );
+
+        if (result == ESP_OK)
+            result = httpd_resp_send_chunk(request, partHeader, headerLength);
+
+        if (result == ESP_OK)
+        {
+            result = httpd_resp_send_chunk(
+                request,
+                reinterpret_cast<const char *>(frame->buf),
+                frame->len
+            );
+        }
+
+        esp_camera_fb_return(frame);
+    }
+
+    return result;
+}
+
+bool startCameraServer()
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+
+    httpd_uri_t streamUri = {};
+    streamUri.uri = "/";
+    streamUri.method = HTTP_GET;
+    streamUri.handler = streamCamera;
+
+    esp_err_t result = httpd_start(&cameraServer, &config);
+
+    if (result != ESP_OK)
+    {
+        Serial.printf("HTTP server failed to start: 0x%x\n", result);
+        return false;
+    }
+
+    result = httpd_register_uri_handler(cameraServer, &streamUri);
+
+    if (result != ESP_OK)
+    {
+        Serial.printf("Stream route registration failed: 0x%x\n", result);
+        httpd_stop(cameraServer);
+        cameraServer = nullptr;
+        return false;
+    }
+
+    return true;
+}
+
+bool initializeCamera()
+{
+    camera_config_t config = {};
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.pin_d0 = Y2_GPIO_NUM;
+    config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM;
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM;
+    config.pin_d7 = Y9_GPIO_NUM;
+    config.pin_xclk = XCLK_GPIO_NUM;
+    config.pin_sccb_sda = SIOD_GPIO_NUM;
+    config.pin_sccb_scl = SIOC_GPIO_NUM;
+    config.pin_pwdn = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href = HREF_GPIO_NUM;
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_JPEG;
+
+    if (psramFound())
+    {
+        config.frame_size = FRAMESIZE_VGA;
+        config.jpeg_quality = 10;
+        config.fb_count = 2;
+    }
+    else
+    {
+        config.frame_size = FRAMESIZE_QVGA;
+        config.jpeg_quality = 12;
+        config.fb_count = 1;
+    }
+
+    const esp_err_t result = esp_camera_init(&config);
+
+    if (result != ESP_OK)
+    {
+        Serial.printf("Camera initialization failed: 0x%x\n", result);
+        return false;
+    }
+
+    return true;
+}
+
+bool connectToWifi()
+{
+    if (strcmp(WIFI_SSID, "YOUR_WIFI_SSID") == 0)
+    {
+        Serial.println("Set WIFI_SSID and WIFI_PASSWORD in include/creds.h.");
+        return false;
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.printf("Connecting to Wi-Fi \"%s\"", WIFI_SSID);
+
+    const uint32_t startedAt = millis();
+
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - startedAt < wifiConnectTimeoutMs)
+    {
+        delay(250);
+        Serial.print('.');
+    }
+
+    Serial.println();
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.println("Wi-Fi connection timed out.");
+        return false;
+    }
+
+    return true;
+}
+} // namespace
+
+void setup()
+{
+    Serial.begin(serialBaud);
+    Serial.setDebugOutput(true);
+    delay(1000);
+
+    Serial.println();
+    Serial.println("AI-Thinker ESP32-CAM");
+
+    if (!initializeCamera() || !connectToWifi() || !startCameraServer())
+        return;
+
+    Serial.print("Camera stream: http://");
+    Serial.println(WiFi.localIP());
+}
+
+void loop()
+{
+    delay(1000);
+}

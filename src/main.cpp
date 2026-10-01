@@ -2,6 +2,7 @@
 #include <driver/i2s.h>
 #include <WiFi.h>
 #include <math.h>
+#include <NightmareNetworks.h>
 
 #if __has_include("creds.h")
 #include "creds.h"
@@ -818,7 +819,7 @@ void handleCommands()
 void setup()
 {
     Serial.begin(SERIAL_BAUD);
-
+    NightmareNetworks::init();
     delay(1000);
 
     Serial.println();

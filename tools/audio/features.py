@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from functools import cached_property
 
 import numpy as np
 from scipy.signal import get_window
@@ -77,6 +78,15 @@ FEATURE_NAMES = (
     + TEMPORAL_FEATURES
 )
 
+# Bookkeeping rather than a measurement, so deliberately NOT part of
+# FEATURE_NAMES (which fixes the columns of every CSV and event JSON).
+# It is how many seconds of history the *_std values above are
+# computed over. Right after a start or an audio gap that is a handful
+# of windows, and a standard deviation of two samples is near zero:
+# every signal looks perfectly stationary. A rule that trusts those
+# values has to be able to tell.
+TEMPORAL_FILL = "temporal_seconds"
+
 
 def power_to_db(power: np.ndarray | float) -> np.ndarray | float:
     """Mean-square power to dBFS."""
@@ -111,8 +121,10 @@ class Features:
     bands: dict[str, float]
     diagnostics: dict[str, float]
 
-    @property
+    @cached_property
     def values(self) -> dict[str, float]:
+        # Cached: the smoother reads this for every window in its
+        # median span, so building it once matters.
         return {"rms": self.rms_db, **self.bands, **self.diagnostics}
 
 
@@ -246,6 +258,7 @@ class FeatureExtractor:
 
         flux_values = [item["spectral_flux"] for item in history]
         diagnostics.update({
+            TEMPORAL_FILL: len(history) * self.hop / self.sample_rate,
             "rms_std": spread("rms"),
             "500-1k_std": spread("500-1k"),
             "1k-2k_std": spread("1k-2k"),

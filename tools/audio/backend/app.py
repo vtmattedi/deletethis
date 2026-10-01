@@ -44,6 +44,7 @@ else:
     from .stream import StreamService
 
 import uvicorn
+from classifier import VERSIONS
 from fastapi import (
     FastAPI,
     HTTPException,
@@ -74,12 +75,43 @@ def _is_benign_proactor_reset(context: dict) -> bool:
 
 
 def load_saved_config(settings: AppConfig) -> dict:
-    """Validate and apply persisted classifier/event settings."""
-    payload = config_module.load_runtime_config(settings.config_path)
+    """Validate and apply persisted classifier/event settings.
+
+    A saved file belongs to the classifier version that wrote it. One
+    with no version key predates versions and is v1. Applying it to a
+    different version would mean guessing what its numbers meant under
+    rules they were never tuned for, so it is refused instead.
+    """
+    payload = dict(
+        config_module.load_runtime_config(settings.config_path)
+    )
+    saved_version = payload.pop("classifierVersion", "v1")
+    running = settings.classifier.version
+
+    if saved_version != running:
+        raise ValueError(
+            f"saved config is for classifier {saved_version}, but "
+            f"this run is {running}; not reinterpreting it"
+        )
+
     changes = ConfigPatch.model_validate(payload).changes()
+    _require_version_fields(running, changes)
     settings.classifier = settings.classifier.patched(changes)
     settings.events = settings.events.patched(changes)
     return changes
+
+
+def _require_version_fields(version: str, changes: dict) -> None:
+    """The v2-only settings mean nothing to a v1 classifier."""
+    foreign = [
+        name for name in config_module.V2_API_FIELDS
+        if name in changes
+    ]
+    if version == "v1" and foreign:
+        raise ValueError(
+            f"{', '.join(foreign)} only apply to classifier v2, "
+            f"but this run is {version}"
+        )
 
 
 def create_app(settings: AppConfig) -> FastAPI:
@@ -121,6 +153,7 @@ def create_app(settings: AppConfig) -> FastAPI:
     @app.get("/api/status")
     async def get_status() -> dict:
         payload = service.status()
+        payload["classifierVersion"] = settings.classifier.version
         payload["config"] = settings.to_api()
 
         return payload
@@ -137,6 +170,15 @@ def create_app(settings: AppConfig) -> FastAPI:
 
         if not changes:
             return settings.to_api()
+
+        try:
+            _require_version_fields(
+                settings.classifier.version, changes
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=422, detail=str(error)
+            ) from error
 
         classifier = settings.classifier.patched(changes)
         events = settings.events.patched(changes)
@@ -315,8 +357,11 @@ def create_app(settings: AppConfig) -> FastAPI:
 
         # Rebuilt with the settings that were live when it was
         # recorded, so the picture matches the decision that was made.
-        recorded = ClassifierConfig().patched(
-            metadata.get("classifierConfig", {})
+        # Events recorded before versions existed carry no
+        # classifierVersion and were classified by v1.
+        recorded = ClassifierConfig.from_api(
+            metadata.get("classifierConfig", {}),
+            metadata.get("classifierVersion"),
         )
 
         timeline = event_timeline(
@@ -370,6 +415,9 @@ def create_app(settings: AppConfig) -> FastAPI:
         try:
             while True:
                 payload = service.status()
+                payload["classifierVersion"] = (
+                    settings.classifier.version
+                )
                 payload["config"] = settings.to_api()
 
                 await socket.send_json(payload)
@@ -490,6 +538,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--classifier",
+        choices=VERSIONS,
+        default="v2",
+        help=(
+            "Classifier version. Each version keeps its events, "
+            "history and saved settings in its own results folder "
+            "(v1: tools/audio/results, v2: tools/audio/results/v2), "
+            "so switching is a restart and never mixes evidence "
+            "(default: v2)"
+        ),
+    )
+
+    parser.add_argument(
         "--live-hz",
         type=float,
         default=config_module.DEFAULT_LIVE_HZ,
@@ -506,7 +567,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
-    settings = AppConfig(
+    settings = AppConfig.for_version(
+        args.classifier,
         target=args.target,
         http_host=args.host,
         http_port=args.port,
@@ -523,6 +585,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print("Backend starting")
     print(f"ESP32: {settings.target}")
+    print(
+        f"Classifier: {settings.classifier.version}   "
+        f"results: {settings.events_dir.parent}"
+    )
 
     uvicorn.run(
         create_app(settings),

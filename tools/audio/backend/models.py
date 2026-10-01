@@ -6,6 +6,20 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from classifier.v2 import STABILITY_FEATURES
+
+# Spelled out for the type checker and for OpenAPI; a test pins it to
+# STABILITY_FEATURES so the two cannot drift.
+StabilityFeature = Literal[
+    "1k-2k_std",
+    "500-1k_std",
+    "2k-4k_std",
+    "rms_std",
+    "spectral_flux_median",
+    "spectral_flux_std",
+]
+assert set(StabilityFeature.__args__) == set(STABILITY_FEATURES)
+
 
 class ConfigPatch(BaseModel):
     """Every field optional: a PATCH changes only what it names."""
@@ -35,6 +49,18 @@ class ConfigPatch(BaseModel):
     )
     eventPostSeconds: float | None = Field(
         default=None, ge=0.0, le=60.0
+    )
+
+    # Classifier v2 only. The API layer rejects these on a v1 run.
+    # `classifierVersion` is intentionally absent: switching version
+    # changes where results are stored, so it is a restart, and
+    # extra="forbid" turns an attempt to patch it into a 422.
+    fanStabilityFeature: StabilityFeature | None = None
+    fanStabilityThreshold: float | None = Field(
+        default=None, gt=0.0, le=100.0
+    )
+    fanStabilityMinSeconds: float | None = Field(
+        default=None, ge=0.0, le=30.0
     )
 
     def changes(self) -> dict:
