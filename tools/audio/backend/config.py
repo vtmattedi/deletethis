@@ -37,6 +37,8 @@ from classifier.common import (
     DEFAULT_HOLD_SECONDS,
     DEFAULT_MEDIAN_SECONDS,
 )
+from classifier.detectors import beep as beep_defaults
+from classifier.detectors import BeepConfig, CompressorConfig, FanConfig
 
 HERE = Path(__file__).resolve().parent
 TOOLS = HERE.parent
@@ -97,6 +99,14 @@ V2_API_FIELDS = (
     "fanStabilityFeature",
     "fanStabilityThreshold",
     "fanStabilityMinSeconds",
+    "beepMinContrastDb",
+    "beepEdgeContrastDb",
+    "beepMinLevelDb",
+    "beepMinMs",
+    "beepMaxMs",
+    "beepMinHz",
+    "beepMaxHz",
+    "beepMaxPeakSpreadHz",
 )
 
 
@@ -120,6 +130,19 @@ class ClassifierConfig:
     )
     fan_stability_min_seconds: float = (
         rules_v2.DEFAULT_FAN_STABILITY_MIN_SECONDS
+    )
+
+    # v2 only: the beep detector. It reads raw windows, so none of the
+    # smoothing settings above apply to it.
+    beep_min_contrast_db: float = beep_defaults.DEFAULT_MIN_CONTRAST_DB
+    beep_edge_contrast_db: float = beep_defaults.DEFAULT_EDGE_CONTRAST_DB
+    beep_min_level_db: float = beep_defaults.DEFAULT_MIN_LEVEL_DB
+    beep_min_ms: float = beep_defaults.DEFAULT_MIN_MS
+    beep_max_ms: float = beep_defaults.DEFAULT_MAX_MS
+    beep_min_hz: float = beep_defaults.DEFAULT_MIN_HZ
+    beep_max_hz: float = beep_defaults.DEFAULT_MAX_HZ
+    beep_max_peak_spread_hz: float = (
+        beep_defaults.DEFAULT_MAX_PEAK_SPREAD_HZ
     )
 
     def __post_init__(self) -> None:
@@ -158,17 +181,39 @@ class ClassifierConfig:
 
         return cls.for_version(chosen).patched(payload)
 
+    def beep_config(self) -> BeepConfig:
+        return BeepConfig(
+            min_contrast_db=self.beep_min_contrast_db,
+            edge_contrast_db=self.beep_edge_contrast_db,
+            min_level_db=self.beep_min_level_db,
+            min_ms=self.beep_min_ms,
+            max_ms=self.beep_max_ms,
+            min_hz=self.beep_min_hz,
+            max_hz=self.beep_max_hz,
+            max_peak_spread_hz=self.beep_max_peak_spread_hz,
+        )
+
     def rule(self):
-        """The decision rule for this version."""
+        """The decision rule for this version.
+
+        v1 is one rule returning one state. v2 is a set of independent
+        detectors; this is its stateless half (fan and compressor), and
+        ``beep_config`` describes the stateful one.
+        """
         if self.version == "v2":
-            return rules_v2.ThresholdsV2(
-                compressor=self.compressor_threshold,
-                fan_mid=self.fan_mid_threshold,
-                fan_high=self.fan_high_threshold,
-                fan_require_both=self.fan_require == "both",
-                stability_feature=self.fan_stability_feature,
-                stability_threshold=self.fan_stability_threshold,
-                stability_min_seconds=self.fan_stability_min_seconds,
+            return rules_v2.ObservationRules(
+                fan=FanConfig(
+                    mid_threshold=self.fan_mid_threshold,
+                    high_threshold=self.fan_high_threshold,
+                    require_both=self.fan_require == "both",
+                    stability_feature=self.fan_stability_feature,
+                    stability_threshold=self.fan_stability_threshold,
+                    stability_min_seconds=self.fan_stability_min_seconds,
+                ),
+                compressor=CompressorConfig(
+                    threshold=self.compressor_threshold
+                ),
+                beep=self.beep_config(),
             )
 
         return rules_v1.Thresholds(
@@ -200,6 +245,14 @@ class ClassifierConfig:
                 "fanStabilityMinSeconds": (
                     self.fan_stability_min_seconds
                 ),
+                "beepMinContrastDb": self.beep_min_contrast_db,
+                "beepEdgeContrastDb": self.beep_edge_contrast_db,
+                "beepMinLevelDb": self.beep_min_level_db,
+                "beepMinMs": self.beep_min_ms,
+                "beepMaxMs": self.beep_max_ms,
+                "beepMinHz": self.beep_min_hz,
+                "beepMaxHz": self.beep_max_hz,
+                "beepMaxPeakSpreadHz": self.beep_max_peak_spread_hz,
             })
 
         return payload
@@ -221,6 +274,14 @@ class ClassifierConfig:
             "fanStabilityFeature": "fan_stability_feature",
             "fanStabilityThreshold": "fan_stability_threshold",
             "fanStabilityMinSeconds": "fan_stability_min_seconds",
+            "beepMinContrastDb": "beep_min_contrast_db",
+            "beepEdgeContrastDb": "beep_edge_contrast_db",
+            "beepMinLevelDb": "beep_min_level_db",
+            "beepMinMs": "beep_min_ms",
+            "beepMaxMs": "beep_max_ms",
+            "beepMinHz": "beep_min_hz",
+            "beepMaxHz": "beep_max_hz",
+            "beepMaxPeakSpreadHz": "beep_max_peak_spread_hz",
         }
 
         changes = {

@@ -1,0 +1,5 @@
+# Extra packages for the analysis tools only (compare_models.py).
+# The backend and the other tools do not need them, and the Docker
+# image does not install them.
+-r requirements.txt
+scikit-learn

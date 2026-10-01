@@ -41,7 +41,7 @@ td { padding: 3px 0; }
 td:last-child { text-align: right; }
 td.name { color: var(--dim); }
 form { display: grid; gap: 8px; }
-label { display: grid; grid-template-columns: 1fr 88px; align-items: center; gap: 8px; }
+label { display: grid; grid-template-columns: 1fr 132px; align-items: center; gap: 8px; }
 label span { color: var(--dim); font-size: 13px; }
 input, select, textarea {
   background: #11131a; color: var(--text); border: 1px solid var(--line);
@@ -115,3 +115,7 @@ li.event.open { background: #20242e; }
 .kv th:first-child { text-align: left; }
 h3 { font-size: 12px; margin: 16px 0 6px; color: var(--dim);
      text-transform: uppercase; letter-spacing: .06em; }
+
+/* Classifier v2: is the fan's band level holding still? */
+dd.steady { color: var(--fan); }
+dd.moving { color: var(--compressor); }

@@ -1,16 +1,30 @@
-"""Score the classifier against human-reviewed events.
+"""Score the classifiers against human-reviewed events.
 
     python tools/audio/evaluate_events.py tools/audio/results/events
     python tools/audio/evaluate_events.py tools/audio/results/events \\
         --classifier v2
 
-Replays each reviewed event's WAV through the same extractor, rule and
-Smoother the live backend uses, and compares the published state with
-what the reviewer said was really happening. Ground truth is
+Replays each reviewed event's WAV through the same extractor, detectors
+and smoothing the live backend uses, and compares what was published
+with what the reviewer said was really happening. Ground truth is
 ``review.actualFrom`` / ``review.actualTo`` and nothing else: the
 classifier's own ``from`` / ``to`` are what is being tested, so they can
 never be the answer. Unreviewed events and ``UNKNOWN`` labels are
 counted and reported but never scored.
+
+Two independent yes/no questions
+--------------------------------
+Classifier v2 does not report one state; it reports whether the fan is
+running and whether the compressor is running, separately. So that is
+how it is scored: each observation has its own confusion matrix and its
+own errors (a fan reported that was not there, a compressor missed that
+was). v1's single state is folded onto the same two questions so the two
+can be compared on equal terms.
+
+The reviewed events are labelled with the old three-way scheme, so the
+yes/no truth is derived from it by one stated assumption -- the
+compressor runs only while the fan does. See ``evaluation.py``. It is a
+bridge for the historical reviews, not the v2 review schema.
 
 The input can be events recorded under any classifier version -- they
 are audio plus a human label, evidence rather than output. Results are
@@ -19,13 +33,14 @@ v1 dataset is only ever read.
 
 Files written (all under the output directory):
 
-    summary.json            parameters, dataset, headline metrics
-    confusion_v1.csv        window-level confusion matrices
+    summary.json              parameters, dataset, headline metrics
+    confusion_v1.csv          window-level confusion, per observation
     confusion_v2.csv
-    per_event.csv           every event, both classifiers side by side
-    per_interference.csv    recall per truth class per interference tag
-    feature_separation.csv  which features tell FAN from OFF at all
+    per_event.csv             every event, both classifiers side by side
+    per_interference.csv      recall per truth value per interference tag
+    feature_separation.csv    which features tell yes from no, per target
     candidate_thresholds.csv  every setting the search tried
+    beeps.csv                 (via check_beeps.py) every beep found
 
 The threshold search and its validation are v2-only and can be skipped
 with ``--no-search``. Read its output with the dataset size in mind: the
@@ -57,7 +72,11 @@ from backend.config import (  # noqa: E402
     result_paths,
 )
 from classifier import VERSIONS  # noqa: E402
-from classifier.v2 import STABILITY_FEATURES, ThresholdsV2  # noqa: E402
+from classifier.detectors import (  # noqa: E402
+    STABILITY_FEATURES,
+    CompressorConfig,
+    FanConfig,
+)
 from features import FEATURE_NAMES  # noqa: E402
 
 DEFAULT_V1_EVENTS = result_paths("v1").events
@@ -65,6 +84,8 @@ DEFAULT_V1_EVENTS = result_paths("v1").events
 # Settings within this much balanced accuracy of the best are treated
 # as equally good when reporting a plateau.
 PLATEAU_TOLERANCE = 0.005
+
+TRUTH_NAME = {0: "absent", 1: "present"}
 
 
 # ---------------------------------------------------------------------
@@ -157,7 +178,6 @@ def table(rows: list[list[str]], header: list[str]) -> str:
         return "  ".join(
             cell.ljust(widths[0]) if i == 0 else cell.rjust(widths[i])
             for i, cell in enumerate(cells)
-            for cell in [cells[i]]
         )
 
     out = [line(header), "  ".join("-" * w for w in widths)]
@@ -166,41 +186,71 @@ def table(rows: list[list[str]], header: list[str]) -> str:
     return "\n".join(out)
 
 
-def confusion_rows(matrix: np.ndarray) -> list[list]:
+CONFUSION_HEADER = [
+    "observation", "truth", "windows", "pred_no", "pred_yes",
+    "pred_nothing_yet", "correct",
+]
+
+
+def confusion_rows(matrices: dict[str, np.ndarray]) -> list[list]:
     rows = []
 
-    for index, label in enumerate(ev.LABELS):
-        total = int(matrix[index].sum())
-        rows.append([
-            label, total, *[int(x) for x in matrix[index]],
-            float(matrix[index, index] / total) if total else "",
-        ])
+    for observation, matrix in matrices.items():
+        for truth in (0, 1):
+            total = int(matrix[truth].sum())
+            rows.append([
+                observation, TRUTH_NAME[truth], total,
+                *[int(x) for x in matrix[truth]],
+                float(matrix[truth, truth] / total) if total else "",
+            ])
 
     return rows
 
 
-CONFUSION_HEADER = [
-    "truth", "windows", "pred_OFF", "pred_FAN", "pred_COMPRESSOR",
-    "pred_none", "recall",
-]
-
-
-def print_confusion(title: str, matrix: np.ndarray) -> None:
+def print_confusions(title: str, matrices: dict[str, np.ndarray]) -> None:
     print(title)
     rows = []
 
-    for index, label in enumerate(ev.LABELS):
-        total = int(matrix[index].sum())
+    for observation, matrix in matrices.items():
+        for truth in (0, 1):
+            total = int(matrix[truth].sum())
+            rows.append([
+                observation, TRUTH_NAME[truth], str(total),
+                *[
+                    f"{matrix[truth, j] / total:.1%}" if total else "-"
+                    for j in range(3)
+                ],
+            ])
+
+    print(table(rows, ["observation", "really", "windows", "said no",
+                       "said yes", "nothing yet"]))
+    print()
+
+
+def observation_metrics(
+    matrices: dict[str, np.ndarray]
+) -> dict[str, dict]:
+    return {
+        observation: ev.metrics(matrix)
+        for observation, matrix in matrices.items()
+    }
+
+
+def print_headline(label: str, summary: dict[str, dict]) -> None:
+    rows = []
+
+    for observation, m in summary.items():
         rows.append([
-            label, str(total),
-            *[
-                f"{matrix[index, j] / total:.1%}" if total else "-"
-                for j in range(4)
-            ],
+            observation,
+            pct(m["recall"]), pct(m["specificity"]),
+            pct(m["precision"]),
+            f"{m['balancedAccuracy']:.3f}"
+            if m["balancedAccuracy"] is not None else "n/a",
+            str(m["falsePositive"]), str(m["falseNegative"]),
         ])
 
-    print(table(rows, ["truth", "windows", "OFF", "FAN", "COMPRESSOR",
-                       "none"]))
+    print(table(rows, [label, "recall", "specificity", "precision",
+                       "balanced", "false yes", "false no"]))
     print()
 
 
@@ -209,23 +259,9 @@ def print_confusion(title: str, matrix: np.ndarray) -> None:
 # ---------------------------------------------------------------------
 
 
-def majority(truth: np.ndarray, predicted: np.ndarray, side: str) -> str:
-    """Most common published state over the scored windows of one side."""
-    scored = truth != ev.UNSCORED
-    codes = predicted[scored]
-
-    if codes.size == 0:
-        return ""
-
-    values, counts = np.unique(codes, return_counts=True)
-    top = int(values[int(np.argmax(counts))])
-
-    return "none" if top < 0 else ev.LABELS[top]
-
-
 def per_event_rows(
     events: list[ev.ScoredEvent],
-    results: dict[str, ev.Evaluation],
+    runs: dict[str, ev.ObservationRun],
 ) -> tuple[list[str], list[list]]:
     header = [
         "id", "time", "source", "recorded_by", "recorded_from",
@@ -233,14 +269,22 @@ def per_event_rows(
         "group", "scored_windows",
     ]
 
-    for name in results:
-        header += [
-            f"{name}_accuracy", f"{name}_majority",
-            f"{name}_off_to_fan", f"{name}_fan_to_off",
-        ]
+    for name in runs:
+        for observation in ev.OBSERVATIONS:
+            header += [
+                f"{name}_{observation}_false_yes",
+                f"{name}_{observation}_false_no",
+            ]
 
-    if len(results) == 2:
-        header.append("v2_minus_v1_accuracy")
+    compare = len(runs) == 2
+
+    if compare:
+        for observation in ev.OBSERVATIONS:
+            header.append(f"v2_minus_v1_{observation}_errors")
+
+    matrices = {
+        name: ev.run_confusions(events, run) for name, run in runs.items()
+    }
 
     rows = []
 
@@ -262,79 +306,78 @@ def per_event_rows(
             event.scored,
         ]
 
-        accuracies = {}
+        errors: dict[str, dict[str, int]] = {}
 
-        for name, result in results.items():
-            predicted = result.published[index]
-            matrix = ev.confusion(event.truth, predicted)
-            total = int(matrix.sum())
-            accuracy = float(np.trace(matrix[:, :3]) / total)
+        for name in runs:
+            errors[name] = {}
 
-            accuracies[name] = accuracy
-            row += [
-                accuracy,
-                majority(event.truth, predicted, "all"),
-                int(matrix[0, 1]),
-                int(matrix[1, 0]),
-            ]
+            for observation in ev.OBSERVATIONS:
+                matrix = matrices[name][observation][index]
+                false_yes = int(matrix[0, 1])
+                false_no = int(matrix[1, 0] + matrix[1, 2] + matrix[0, 2])
 
-        if len(results) == 2:
-            row.append(accuracies["v2"] - accuracies["v1"])
+                errors[name][observation] = false_yes + false_no
+                row += [false_yes, false_no]
+
+        if compare:
+            for observation in ev.OBSERVATIONS:
+                row.append(
+                    errors["v2"][observation] - errors["v1"][observation]
+                )
 
         rows.append(row)
 
     return header, rows
 
 
+PER_INTERFERENCE_HEADER = [
+    "classifier", "observation", "interference", "really", "windows",
+    "pred_no", "pred_yes", "pred_nothing_yet", "correct",
+]
+
+
 def per_interference_rows(
     events: list[ev.ScoredEvent],
-    results: dict[str, ev.Evaluation],
+    runs: dict[str, ev.ObservationRun],
 ) -> list[list]:
     rows = []
 
-    for name, result in results.items():
-        by_tag: dict[str, np.ndarray] = {}
+    for name, run in runs.items():
+        matrices = ev.run_confusions(events, run)
 
-        for index, event in enumerate(events):
-            tag = event.record.interference_label
-            matrix = ev.confusion(event.truth, result.published[index])
-            by_tag[tag] = by_tag.get(tag, 0) + matrix
+        for observation in ev.OBSERVATIONS:
+            by_tag: dict[str, np.ndarray] = {}
 
-        for tag in sorted(by_tag):
-            matrix = by_tag[tag]
+            for index, event in enumerate(events):
+                tag = event.record.interference_label
+                by_tag[tag] = (
+                    by_tag.get(tag, 0) + matrices[observation][index]
+                )
 
-            for label_index, label in enumerate(ev.LABELS):
-                total = int(matrix[label_index].sum())
+            for tag in sorted(by_tag):
+                for truth in (0, 1):
+                    matrix = by_tag[tag]
+                    total = int(matrix[truth].sum())
 
-                if not total:
-                    continue
+                    if not total:
+                        continue
 
-                rows.append([
-                    name, tag, label, total,
-                    *[int(x) for x in matrix[label_index]],
-                    float(matrix[label_index, label_index] / total),
-                ])
+                    rows.append([
+                        name, observation, tag, TRUTH_NAME[truth], total,
+                        *[int(x) for x in matrix[truth]],
+                        float(matrix[truth, truth] / total),
+                    ])
 
     return rows
 
 
-PER_INTERFERENCE_HEADER = [
-    "classifier", "interference", "truth", "windows", "pred_OFF",
-    "pred_FAN", "pred_COMPRESSOR", "pred_none", "recall",
-]
-
-
 # ---------------------------------------------------------------------
-# Which features separate FAN from OFF
+# Which features separate present from absent
 # ---------------------------------------------------------------------
 
 
 def best_split(low: np.ndarray, high: np.ndarray) -> tuple[float, float]:
-    """Threshold maximising balanced accuracy, 'low' below it.
-
-    ``low`` and ``high`` are samples of the class expected to sit below
-    and above. Returns (threshold, balanced accuracy).
-    """
+    """Threshold maximising balanced accuracy, 'low' below it."""
     values = np.concatenate([low, high])
     candidates = np.unique(np.percentile(values, np.linspace(1, 99, 99)))
 
@@ -349,66 +392,54 @@ def best_split(low: np.ndarray, high: np.ndarray) -> tuple[float, float]:
     return best
 
 
-def feature_separation(
-    fast: ev.FastEvaluator, rule: ThresholdsV2
+def separation(
+    fast: ev.FastEvaluator,
+    target: str,
+    restrict: np.ndarray,
 ) -> list[list]:
-    """Rank features by how well they separate FAN from OFF.
+    """Rank features by how well they separate present from absent."""
+    truth = np.concatenate(fast.truth[target])
 
-    Restricted to the windows that matter: those where v2 already sees
-    fan *energy* and no compressor. Anything the energy test rejects is
-    not a candidate for the gate to fix.
-    """
-    mid = fast.column("500-1k") >= rule.fan_mid
-    high = fast.column("1k-2k") >= rule.fan_high
-    energy = (mid & high) if rule.fan_require_both else (mid | high)
-    energy &= fast.column("30-80") < rule.compressor
-
-    truth = np.concatenate(fast.truth)
-
-    fan = energy & (truth == ev.LABEL_CODE["FAN"])
-    off = energy & (truth == ev.LABEL_CODE["OFF"])
+    present = restrict & (truth == 1)
+    absent = restrict & (truth == 0)
 
     rows = []
 
     for name in FEATURE_NAMES:
         values = fast.column(name)
-        a, b = values[fan], values[off]
+        a, b = values[present], values[absent]
 
         if a.size < 2 or b.size < 2:
             continue
 
-        # AUC as the Mann-Whitney statistic: P(random FAN window sits
-        # above a random OFF window). 0.5 is no information.
+        # AUC as the Mann-Whitney statistic: P(a random present window
+        # sits above a random absent one). 0.5 is no information.
         ranks = rankdata(np.concatenate([a, b]))
         auc = (ranks[: a.size].sum() - a.size * (a.size + 1) / 2) / (
             a.size * b.size
         )
 
-        # Direction: a gate keeps FAN, so say which side FAN lives on.
-        fan_lower = auc < 0.5
-        low, high_ = (a, b) if fan_lower else (b, a)
-        threshold, balanced = best_split(low, high_)
+        present_lower = auc < 0.5
+        low, high = (a, b) if present_lower else (b, a)
+        threshold, balanced = best_split(low, high)
 
         rows.append([
-            name,
-            "lower" if fan_lower else "higher",
-            float(max(auc, 1 - auc)),
-            threshold,
-            balanced,
-            float(np.median(a)),
-            float(np.median(b)),
-            int(a.size),
-            int(b.size),
+            target, name,
+            "lower" if present_lower else "higher",
+            float(max(auc, 1 - auc)), threshold, balanced,
+            float(np.median(a)), float(np.median(b)),
+            int(a.size), int(b.size),
         ])
 
-    rows.sort(key=lambda row: row[2], reverse=True)
+    rows.sort(key=lambda row: row[3], reverse=True)
 
     return rows
 
 
 FEATURE_SEPARATION_HEADER = [
-    "feature", "fan_is", "auc", "best_threshold", "balanced_accuracy",
-    "fan_median", "off_median", "fan_windows", "off_windows",
+    "target", "feature", "present_is", "auc", "best_threshold",
+    "balanced_accuracy", "present_median", "absent_median",
+    "present_windows", "absent_windows",
 ]
 
 
@@ -417,106 +448,138 @@ FEATURE_SEPARATION_HEADER = [
 # ---------------------------------------------------------------------
 
 
-def with_rule(rule: ThresholdsV2, **changes) -> ThresholdsV2:
-    values = {
-        "compressor": rule.compressor,
-        "fan_mid": rule.fan_mid,
-        "fan_high": rule.fan_high,
-        "fan_require_both": rule.fan_require_both,
-        "stability_feature": rule.stability_feature,
-        "stability_threshold": rule.stability_threshold,
-        "stability_min_seconds": rule.stability_min_seconds,
-    }
-    values.update(changes)
-
-    return ThresholdsV2(**values)
-
-
-class Search:
-    """Try v2 settings and keep every result."""
-
-    def __init__(
-        self,
-        fast: ev.FastEvaluator,
-        events: list[ev.ScoredEvent],
-    ) -> None:
-        self.fast = fast
-        self.events = events
-        self.groups = np.array([e.group for e in events])
-        self.rows: list[list] = []
-        self.per_event: dict[tuple, np.ndarray] = {}
-
-    def run(self, stage: str, rule: ThresholdsV2) -> dict:
-        per_event = self.fast.confusion(rule)
-        total = per_event.sum(axis=0)
-        summary = ev.metrics(total)
-
-        accuracy = np.array([
-            np.trace(m[:, :3]) / max(m.sum(), 1) for m in per_event
-        ])
-
-        key = (
-            stage, rule.stability_feature, rule.stability_threshold,
-            rule.compressor, rule.fan_mid, rule.fan_high,
-        )
-        self.per_event[key] = per_event
-
-        row = {
-            "stage": stage,
-            "feature": rule.stability_feature,
-            "stability_threshold": rule.stability_threshold,
-            "compressor": rule.compressor,
-            "fan_mid": rule.fan_mid,
-            "fan_high": rule.fan_high,
-            "balanced": summary["balancedAccuracy"],
-            "recall_off": summary["recall"]["OFF"],
-            "recall_fan": summary["recall"]["FAN"],
-            "recall_compressor": summary["recall"]["COMPRESSOR"],
-            "off_to_fan": summary["offToFan"],
-            "off_to_compressor": summary["offToCompressor"],
-            "fan_to_off": summary["fanToOff"],
-            "compressor_misses": summary["compressorMisses"],
-            "event_accuracy": float(accuracy.mean()),
-        }
-        self.rows.append(row)
-
-        return row
-
-    def table(self) -> tuple[list[str], list[list]]:
-        header = list(self.rows[0])
-
-        return header, [
-            [
-                "" if value is None else value
-                for value in row.values()
-            ]
-            for row in self.rows
-        ]
-
-
 def threshold_grid(values: np.ndarray, points: int = 33) -> np.ndarray:
     """A grid over the range a feature actually takes."""
     low, high = np.percentile(values, [2, 98])
-    grid = np.linspace(low, high, points)
 
-    return np.unique(np.round(grid, 3))
+    return np.unique(np.round(np.linspace(low, high, points), 3))
+
+
+def with_fan(config: FanConfig, **changes) -> FanConfig:
+    values = {
+        "mid_threshold": config.mid_threshold,
+        "high_threshold": config.high_threshold,
+        "require_both": config.require_both,
+        "stability_feature": config.stability_feature,
+        "stability_threshold": config.stability_threshold,
+        "stability_min_seconds": config.stability_min_seconds,
+    }
+    values.update(changes)
+
+    return FanConfig(**values)
+
+
+class Search:
+    """Try detector settings and keep every result.
+
+    The detectors are independent, so a fan setting is judged only on the
+    fan question and a compressor setting only on the compressor one.
+    """
+
+    HEADER = [
+        "stage", "observation", "setting", "value", "feature",
+        "fan_mid", "fan_high", "compressor",
+        "balanced", "recall", "specificity", "false_yes", "false_no",
+        "event_accuracy",
+    ]
+
+    def __init__(self, fast: ev.FastEvaluator) -> None:
+        self.fast = fast
+        self.groups = np.array([e.group for e in fast.events])
+        self.rows: list[list] = []
+        self.stacks: dict[tuple, np.ndarray] = {}
+
+    def record(
+        self,
+        stage: str,
+        observation: str,
+        per_event: np.ndarray,
+        key: tuple,
+        *,
+        setting: str,
+        value: float,
+        feature: str = "",
+        fan: FanConfig | None = None,
+        compressor: CompressorConfig | None = None,
+    ) -> dict:
+        summary = ev.metrics(per_event.sum(axis=0))
+
+        accuracy = np.array([
+            (m[0, 0] + m[1, 1]) / max(m.sum(), 1) for m in per_event
+        ])
+
+        self.stacks[(stage,) + key] = per_event
+
+        row = {
+            "stage": stage,
+            "observation": observation,
+            "setting": setting,
+            "value": value,
+            "feature": feature,
+            "balanced": summary["balancedAccuracy"],
+            "recall": summary["recall"],
+            "specificity": summary["specificity"],
+            "false_yes": summary["falsePositive"],
+            "false_no": summary["falseNegative"],
+            "event_accuracy": float(accuracy.mean()),
+        }
+
+        self.rows.append([
+            stage, observation, setting, value, feature,
+            fan.mid_threshold if fan else "",
+            fan.high_threshold if fan else "",
+            compressor.threshold if compressor else "",
+            summary["balancedAccuracy"], summary["recall"],
+            summary["specificity"], summary["falsePositive"],
+            summary["falseNegative"], float(accuracy.mean()),
+        ])
+
+        return row
+
+    def fan_stability(self, base: FanConfig, feature: str, value: float):
+        config = with_fan(
+            base, stability_feature=feature, stability_threshold=value
+        )
+
+        return self.record(
+            "fan_stability", "fan", self.fast.fan_confusion(config),
+            (feature, value), setting="stability_threshold", value=value,
+            feature=feature, fan=config,
+        )
+
+    def fan_bands(self, base: FanConfig, mid: float, high: float):
+        config = with_fan(base, mid_threshold=mid, high_threshold=high)
+
+        return self.record(
+            "fan_bands", "fan", self.fast.fan_confusion(config),
+            (mid, high), setting="bands", value=mid, fan=config,
+        )
+
+    def compressor(self, threshold: float):
+        config = CompressorConfig(threshold=threshold)
+
+        return self.record(
+            "compressor", "compressor",
+            self.fast.compressor_confusion(config),
+            (threshold,), setting="threshold", value=threshold,
+            compressor=config,
+        )
+
+    def table(self) -> tuple[list[str], list[list]]:
+        return self.HEADER, self.rows
 
 
 def plateau(rows: list[dict], tolerance: float) -> dict:
     """Settings within ``tolerance`` of the best, along one sweep."""
-    ordered = sorted(rows, key=lambda r: r["stability_threshold"])
+    ordered = sorted(rows, key=lambda r: r["value"])
     best = max(r["balanced"] for r in ordered)
 
     good = [
-        r["stability_threshold"] for r in ordered
-        if r["balanced"] >= best - tolerance
+        r["value"] for r in ordered if r["balanced"] >= best - tolerance
     ]
 
     return {
-        "best": next(
-            r["stability_threshold"] for r in ordered
-            if r["balanced"] == best
-        ),
+        "best": next(r["value"] for r in ordered if r["balanced"] == best),
         "bestBalanced": best,
         "plateau": [min(good), max(good)],
         "recommended": float(np.median(good)),
@@ -525,61 +588,118 @@ def plateau(rows: list[dict], tolerance: float) -> dict:
 
 
 def leave_one_group_out(
-    search: Search,
-    sweep: list[dict],
-    feature: str,
+    stack: np.ndarray,
+    groups: np.ndarray,
+    values: list[float],
 ) -> dict:
-    """Pick the threshold without the held-out group, then test on it.
+    """Pick the setting without the held-out group, then test on it.
 
-    Only the stability threshold is chosen here; everything else is
-    held at the configured values. So the gap between this and the
-    in-sample best measures how much choosing that one number from this
-    data flatters it -- which is the figure to believe about the gate.
+    ``stack`` is the per-event confusion for each candidate value,
+    shape (values, events, 2, 3). Only the one setting is chosen here;
+    everything else is held at the configured values. So the gap between
+    this and the in-sample best measures how much choosing that one
+    number from this data flatters it -- which is the figure to believe.
     """
-    thresholds = sorted({r["stability_threshold"] for r in sweep})
-
-    stack = np.stack([
-        search.per_event[
-            ("stability", feature, t, sweep[0]["compressor"],
-             sweep[0]["fan_mid"], sweep[0]["fan_high"])
-        ]
-        for t in thresholds
-    ])                                        # (T, E, 3, 4)
-
-    groups = search.groups
-    held_out_total = np.zeros((3, 4), dtype=np.int64)
+    held_out_total = np.zeros((2, 3), dtype=np.int64)
     chosen: list[float] = []
 
     def balanced(matrix: np.ndarray) -> float:
-        recall = [
-            matrix[i, i] / matrix[i].sum() if matrix[i].sum() else np.nan
-            for i in range(3)
-        ]
-        return float(np.nanmean(recall))
+        return ev.metrics(matrix)["balancedAccuracy"] or 0.0
 
     for group in np.unique(groups):
         train = groups != group
-        scores = [balanced(stack[t][train].sum(axis=0))
-                  for t in range(len(thresholds))]
+        scores = [
+            balanced(stack[t][train].sum(axis=0))
+            for t in range(len(values))
+        ]
 
-        # Several thresholds often tie on a plateau; take the middle
-        # one, as the recommendation would.
+        # Several values often tie on a plateau; take the middle one,
+        # as the recommendation would.
         best = max(scores)
         tied = [i for i, s in enumerate(scores) if s >= best - 1e-12]
         pick = tied[len(tied) // 2]
 
-        chosen.append(thresholds[pick])
+        chosen.append(values[pick])
         held_out_total += stack[pick][~train].sum(axis=0)
 
     summary = ev.metrics(held_out_total)
     summary["groups"] = int(len(np.unique(groups)))
-    summary["thresholdsChosen"] = {
+    summary["valuesChosen"] = {
         "min": float(min(chosen)),
         "median": float(np.median(chosen)),
         "max": float(max(chosen)),
     }
 
     return summary
+
+
+# ---------------------------------------------------------------------
+# Beeps in the reviewed events
+# ---------------------------------------------------------------------
+
+
+def beep_summary(
+    records: list[ev.EventRecord],
+    cache: ev.FeatureCache,
+    config,
+) -> dict:
+    """Beeps found across every event, by what the reviewer said.
+
+    Includes unreviewed events and v2 observation events: a beep needs no
+    review to be found. Grouped by the reviewed transition because the
+    interesting question is whether a power command always beeps.
+    """
+    by_kind: dict[str, dict] = {}
+    offsets: dict[str, list[float]] = {}
+    total = 0
+    seconds = 0.0
+
+    for record in records:
+        windows = cache.get(record)
+        found, _ = ev.replay_beeps(windows, config)
+
+        seconds += len(windows.times) * windows.hop_seconds
+        total += len(found)
+
+        if record.labelled:
+            kind = f"{record.actual_from}->{record.actual_to}"
+        else:
+            kind = (
+                f"{record.metadata.get('from')}->"
+                f"{record.metadata.get('to')} (not reviewed)"
+            )
+
+        bucket = by_kind.setdefault(kind, {"events": 0, "withBeep": 0})
+        bucket["events"] += 1
+        bucket["withBeep"] += bool(found)
+
+        for beep in found:
+            offsets.setdefault(kind, []).append(
+                beep.start_time - record.pre_seconds
+            )
+
+    # How far before the published transition the nearest beep fell,
+    # for the events whose state really changed.
+    near = {}
+
+    for kind, values in offsets.items():
+        close = [v for v in values if -3.2 < v < -2.0]
+
+        if close:
+            near[kind] = {
+                "count": len(close),
+                "medianSeconds": float(np.median(close)),
+                "minSeconds": float(min(close)),
+                "maxSeconds": float(max(close)),
+            }
+
+    return {
+        "beeps": total,
+        "minutesOfAudio": seconds / 60.0,
+        "perHour": total / (seconds / 3600.0) if seconds else 0.0,
+        "byTransition": dict(sorted(by_kind.items())),
+        "beforePublishedTransition": near,
+    }
 
 
 # ---------------------------------------------------------------------
@@ -599,36 +719,36 @@ def plot_sweep(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    ordered = sorted(sweep, key=lambda r: r["stability_threshold"])
-    x = [r["stability_threshold"] for r in ordered]
+    ordered = sorted(sweep, key=lambda r: r["value"])
+    x = [r["value"] for r in ordered]
 
     figure, (top, bottom) = plt.subplots(
         2, 1, figsize=(9, 7), sharex=True
     )
 
-    top.plot(x, [r["recall_fan"] for r in ordered], label="FAN recall",
-             color="#1f9d55")
-    top.plot(x, [r["recall_off"] for r in ordered], label="OFF recall",
-             color="#3b7dd8")
+    top.plot(x, [r["recall"] for r in ordered],
+             label="fan found when running", color="#1f9d55")
+    top.plot(x, [r["specificity"] for r in ordered],
+             label="no fan reported when not running", color="#3b7dd8")
     top.plot(x, [r["balanced"] for r in ordered], label="balanced",
              color="black", linestyle="--")
 
     if v1_summary is not None:
-        top.axhline(v1_summary["recall"]["FAN"], color="#1f9d55",
-                    linestyle=":", alpha=0.6, label="v1 FAN recall")
-        top.axhline(v1_summary["recall"]["OFF"], color="#3b7dd8",
-                    linestyle=":", alpha=0.6, label="v1 OFF recall")
+        top.axhline(v1_summary["recall"], color="#1f9d55",
+                    linestyle=":", alpha=0.6, label="v1 recall")
+        top.axhline(v1_summary["specificity"], color="#3b7dd8",
+                    linestyle=":", alpha=0.6, label="v1 specificity")
 
     top.set_ylabel("window-level")
     top.set_ylim(0, 1.02)
-    top.set_title(f"Stationarity gate: {feature}")
-    top.legend(ncol=3, fontsize=8)
+    top.set_title(f"Fan detector: stationarity gate on {feature}")
+    top.legend(ncol=2, fontsize=8)
     top.grid(alpha=0.3)
 
-    bottom.plot(x, [r["off_to_fan"] for r in ordered],
-                label="OFF called FAN", color="#d64545")
-    bottom.plot(x, [r["fan_to_off"] for r in ordered],
-                label="FAN called OFF", color="#d2691e")
+    bottom.plot(x, [r["false_yes"] for r in ordered],
+                label="fan reported, not running", color="#d64545")
+    bottom.plot(x, [r["false_no"] for r in ordered],
+                label="fan running, not reported", color="#d2691e")
     bottom.set_ylabel("windows")
     bottom.set_xlabel(f"{feature} threshold (dB)")
     bottom.legend(fontsize=8)
@@ -650,7 +770,7 @@ def plot_sweep(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Score the classifier against reviewed events.",
+        description="Score the classifiers against reviewed events.",
     )
 
     parser.add_argument(
@@ -712,6 +832,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-plots", action="store_true", help="Do not write plots",
     )
     parser.add_argument(
+        "--no-beeps", action="store_true",
+        help="Skip the beep summary",
+    )
+    parser.add_argument(
         "--cache-dir", type=Path, default=None,
         help="Where extracted features are cached (default: <out>/cache)",
     )
@@ -754,6 +878,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"        {counts['unreviewed']} unreviewed and "
           f"{counts['reviewedUnknown']} reviewed-UNKNOWN are counted but "
           "never scored")
+
+    if counts["observationEvents"]:
+        print(f"        {counts['observationEvents']} v2 observation "
+              "events are not scored here (they review each observation "
+              "separately)")
+
     print(f"        final state: {counts['byFinalState']}")
     print(f"        interference: {counts['byInterference']}")
 
@@ -780,6 +910,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Skipping {args.warmup:g}s warm-up and {args.guard:g}s either "
           f"side of real transitions; groups are events within "
           f"{args.group_gap:g}s of each other.")
+    print("Truth for the yes/no questions is derived from the old labels "
+          "assuming the compressor runs only while the fan does.")
 
     wanted = (
         list(VERSIONS) if args.classifier == "both" else [args.classifier]
@@ -799,44 +931,49 @@ def main(argv: list[str] | None = None) -> int:
         configs[version] = config
         sources[version] = source
 
-    results: dict[str, ev.Evaluation] = {}
-    matrices: dict[str, np.ndarray] = {}
-    candidate_matrices: dict[str, np.ndarray] = {}
+    runs: dict[str, ev.ObservationRun] = {}
+    published: dict[str, dict[str, np.ndarray]] = {}
+    candidate: dict[str, dict[str, np.ndarray]] = {}
 
     for version in wanted:
         config = configs[version]
 
-        results[version] = ev.evaluate(
-            version, events, config.rule(),
-            config.median_seconds, config.hold_seconds,
-        )
+        if version == "v1":
+            runs[version] = ev.run_v1(
+                version, events, config.rule(),
+                config.median_seconds, config.hold_seconds,
+            )
+        else:
+            runs[version] = ev.run_v2(
+                version, events, config.rule(),
+                config.median_seconds, config.hold_seconds,
+            )
 
-        matrices[version] = results[version].matrices(events).sum(axis=0)
-        candidate_matrices[version] = results[version].matrices(
-            events, "candidate"
-        ).sum(axis=0)
+        per_event = ev.run_confusions(events, runs[version])
+        published[version] = {
+            o: m.sum(axis=0) for o, m in per_event.items()
+        }
+        candidate[version] = {
+            o: m.sum(axis=0)
+            for o, m in ev.run_confusions(
+                events, runs[version], "candidate"
+            ).items()
+        }
 
         print(f"\n=== {version}: {sources[version]}")
         api = config.to_api()
         print("    " + ", ".join(
             f"{k}={v}" for k, v in api.items()
-            if k not in ("classifierVersion",)
+            if k != "classifierVersion" and not k.startswith("beep")
         ))
-        print_confusion(
-            f"Published state, window level ({version})", matrices[version]
+        print_confusions(
+            f"Published, window level ({version})", published[version]
         )
-
-        summary = ev.metrics(matrices[version])
-        print(f"    balanced accuracy {summary['balancedAccuracy']:.3f}   "
-              f"OFF->FAN {summary['offToFan']}   "
-              f"OFF->COMPRESSOR {summary['offToCompressor']}   "
-              f"FAN->OFF {summary['fanToOff']}   "
-              f"COMPRESSOR missed {summary['compressorMisses']}")
+        print_headline(version, observation_metrics(published[version]))
 
         write_csv(
-            args.out / f"confusion_{version}.csv",
-            CONFUSION_HEADER,
-            confusion_rows(matrices[version]),
+            args.out / f"confusion_{version}.csv", CONFUSION_HEADER,
+            confusion_rows(published[version]),
         )
 
     # ---- reference: v1 at its code default, to show why -38 matters ----
@@ -846,31 +983,36 @@ def main(argv: list[str] | None = None) -> int:
         default = ClassifierConfig.for_version("v1")
 
         if default.rule() != configs["v1"].rule():
-            baseline = ev.evaluate(
+            baseline = ev.run_v1(
                 "v1-default", events, default.rule(),
                 default.median_seconds, default.hold_seconds,
             )
-            reference = ev.metrics(
-                baseline.matrices(events).sum(axis=0)
-            )
-            reference["compressorThreshold"] = default.compressor_threshold
+            reference = {
+                "compressorThreshold": default.compressor_threshold,
+                **observation_metrics({
+                    o: m.sum(axis=0)
+                    for o, m in ev.run_confusions(events, baseline).items()
+                }),
+            }
 
-    header, rows = per_event_rows(events, results)
+    header, rows = per_event_rows(events, runs)
     write_csv(args.out / "per_event.csv", header, rows)
+
+    interference_rows = per_interference_rows(events, runs)
     write_csv(
-        args.out / "per_interference.csv",
-        PER_INTERFERENCE_HEADER,
-        per_interference_rows(events, results),
+        args.out / "per_interference.csv", PER_INTERFERENCE_HEADER,
+        interference_rows,
     )
 
-    print("\nBy interference (published state; recall per truth class)")
-    shown = per_interference_rows(events, results)
+    print("By interference (published; share of windows answered "
+          "correctly)")
     print(table(
         [
-            [r[0], r[1], r[2], str(r[3]), f"{r[8]:.1%}"]
-            for r in shown
+            [r[0], r[1], r[2], r[3], str(r[4]), f"{r[8]:.1%}"]
+            for r in interference_rows
         ],
-        ["classifier", "interference", "truth", "windows", "recall"],
+        ["classifier", "observation", "interference", "really",
+         "windows", "correct"],
     ))
 
     # ---- search and validation (v2) ----------------------------------------
@@ -878,76 +1020,92 @@ def main(argv: list[str] | None = None) -> int:
 
     if "v2" in wanted and not args.no_search:
         config = configs["v2"]
-        rule = config.rule()
+        rules = config.rule()
 
         fast = ev.FastEvaluator(events, config.median_seconds,
                                 config.hold_seconds)
 
         checked = ev.verify_fast_path(
-            events, rule, config.median_seconds, config.hold_seconds,
+            events, rules, config.median_seconds, config.hold_seconds,
             limit=min(20, len(events)),
         )
 
-        search = Search(fast, events)
-        separation = feature_separation(fast, rule)
-        write_csv(
-            args.out / "feature_separation.csv",
-            FEATURE_SEPARATION_HEADER, separation,
+        search = Search(fast)
+
+        # -- which features say anything at all ---------------------------
+        fan_energy = (
+            (fast.column("500-1k") >= rules.fan.mid_threshold)
+            & (fast.column("1k-2k") >= rules.fan.high_threshold)
+            if rules.fan.require_both else
+            (fast.column("500-1k") >= rules.fan.mid_threshold)
+            | (fast.column("1k-2k") >= rules.fan.high_threshold)
         )
 
-        print("\nFeatures that separate FAN from OFF, among windows where "
-              "v2 sees fan energy and no compressor (top 8 by AUC)")
+        everywhere = np.ones(len(fast.matrix), dtype=bool)
+        fan_separation = separation(fast, "fan", fan_energy)
+        compressor_separation = separation(
+            fast, "compressor", everywhere
+        )
+
+        write_csv(
+            args.out / "feature_separation.csv", FEATURE_SEPARATION_HEADER,
+            fan_separation + compressor_separation,
+        )
+
+        print("\nFeatures that tell a running fan from none, among the "
+              "windows that already show fan energy (top 6 by AUC)")
         print(table(
             [
-                [r[0], r[1], f"{r[2]:.3f}", f"{r[3]:.3g}",
-                 f"{r[4]:.3f}", f"{r[5]:.3g}", f"{r[6]:.3g}"]
-                for r in separation[:8]
+                [r[1], r[2], f"{r[3]:.3f}", f"{r[4]:.3g}",
+                 f"{r[5]:.3f}", f"{r[6]:.3g}", f"{r[7]:.3g}"]
+                for r in fan_separation[:6]
             ],
             ["feature", "fan is", "AUC", "best thr", "bal.acc",
-             "fan med", "off med"],
+             "fan med", "none med"],
+        ))
+        print("\nFeatures that tell a running compressor from none "
+              "(top 4 by AUC)")
+        print(table(
+            [
+                [r[1], r[2], f"{r[3]:.3f}", f"{r[4]:.3g}",
+                 f"{r[5]:.3f}", f"{r[6]:.3g}", f"{r[7]:.3g}"]
+                for r in compressor_separation[:4]
+            ],
+            ["feature", "comp is", "AUC", "best thr", "bal.acc",
+             "comp med", "none med"],
         ))
 
+        # -- the sweeps -----------------------------------------------------
         sweeps: dict[str, list[dict]] = {}
 
         for feature in STABILITY_FEATURES:
-            values = fast.column(feature)
             sweeps[feature] = [
-                search.run(
-                    "stability",
-                    with_rule(rule, stability_feature=feature,
-                              stability_threshold=float(t)),
-                )
-                for t in threshold_grid(values)
+                search.fan_stability(rules.fan, feature, float(value))
+                for value in threshold_grid(fast.column(feature))
             ]
-
-        # Compressor and fan-band sweeps at the configured gate.
-        for threshold in np.arange(-50.0, -25.5, 1.0):
-            search.run("compressor", with_rule(
-                rule, compressor=float(threshold)))
 
         for mid in np.arange(-66.0, -55.5, 1.0):
             for high in np.arange(-69.0, -58.5, 1.0):
-                search.run("fan_bands", with_rule(
-                    rule, fan_mid=float(mid), fan_high=float(high)))
+                search.fan_bands(rules.fan, float(mid), float(high))
 
-        # A joint look around the configured setting.
-        for comp in rule.compressor + np.arange(-2, 2.5, 1.0):
-            for mid in rule.fan_mid + np.arange(-2, 2.5, 1.0):
-                for high in rule.fan_high + np.arange(-2, 2.5, 1.0):
-                    search.run("joint", with_rule(
-                        rule, compressor=float(comp),
-                        fan_mid=float(mid), fan_high=float(high)))
+        compressor_sweep = [
+            search.compressor(float(value))
+            for value in np.arange(-50.0, -25.5, 1.0)
+        ]
 
         header, rows = search.table()
         write_csv(args.out / "candidate_thresholds.csv", header, rows)
 
-        v1_summary = ev.metrics(matrices["v1"]) if "v1" in matrices else None
+        v1_fan = (
+            observation_metrics(published["v1"])["fan"]
+            if "v1" in published else None
+        )
 
         print(f"\nThreshold search: {len(search.rows)} settings tried "
-              f"(fast path checked against the real Smoother on "
+              f"(fast path checked against the real smoother on "
               f"{checked} events)")
-        print("\nStationarity gate by feature (others held at the "
-              "configured values)")
+        print("\nFan stationarity gate by feature (everything else held "
+              "at the configured values)")
 
         summary_rows = []
         feature_results = {}
@@ -955,70 +1113,88 @@ def main(argv: list[str] | None = None) -> int:
         for feature, sweep in sweeps.items():
             found = plateau(sweep, PLATEAU_TOLERANCE)
             feature_results[feature] = found
-            best = next(
-                r for r in sweep
-                if r["stability_threshold"] == found["best"]
-            )
+            best = next(r for r in sweep if r["value"] == found["best"])
             summary_rows.append([
                 feature,
                 f"{found['best']:.3g}",
                 f"{found['plateau'][0]:.3g}..{found['plateau'][1]:.3g}",
                 f"{found['bestBalanced']:.3f}",
-                pct(best["recall_fan"]),
-                str(best["off_to_fan"]),
-                str(best["fan_to_off"]),
+                pct(best["recall"]), pct(best["specificity"]),
+                str(best["false_yes"]), str(best["false_no"]),
             ])
 
         print(table(
             summary_rows,
-            ["feature", "best thr", "plateau", "balanced", "FAN recall",
-             "OFF->FAN", "FAN->OFF"],
+            ["feature", "best thr", "plateau", "balanced", "fan found",
+             "no-fan ok", "false yes", "false no"],
         ))
 
-        feature = rule.stability_feature
+        feature = rules.fan.stability_feature
         sweep = sweeps[feature]
         found = feature_results[feature]
+        values = sorted({r["value"] for r in sweep})
 
-        validation = leave_one_group_out(search, sweep, feature)
+        fan_validation = leave_one_group_out(
+            np.stack([
+                search.stacks[("fan_stability", feature, value)]
+                for value in values
+            ]),
+            search.groups, values,
+        )
 
-        print(f"\nGate on {feature}: best {found['best']:.3g} dB, "
-              f"plateau {found['plateau'][0]:.3g}..{found['plateau'][1]:.3g}"
-              f", recommended {found['recommended']:.3g} dB")
-        print(f"Leave-one-group-out ({validation['groups']} groups): "
-              f"balanced accuracy {validation['balancedAccuracy']:.3f} "
-              f"vs in-sample best {found['bestBalanced']:.3f}; chose "
-              f"thresholds {validation['thresholdsChosen']['min']:.3g}.."
-              f"{validation['thresholdsChosen']['max']:.3g}")
+        compressor_values = sorted({r["value"] for r in compressor_sweep})
+        compressor_found = plateau(compressor_sweep, PLATEAU_TOLERANCE)
+        compressor_validation = leave_one_group_out(
+            np.stack([
+                search.stacks[("compressor", value)]
+                for value in compressor_values
+            ]),
+            search.groups, compressor_values,
+        )
 
-        compressor_rows = [
-            r for r in search.rows if r["stage"] == "compressor"
-        ]
-        best_compressor = max(compressor_rows, key=lambda r: r["balanced"])
-
-        print(f"Compressor threshold (gate as configured): best "
-              f"{best_compressor['compressor']:g} dB "
-              f"(balanced {best_compressor['balanced']:.3f}); configured "
-              f"{rule.compressor:g} dB")
+        print(f"\nFan gate on {feature}: best {found['best']:.3g} dB, "
+              f"plateau {found['plateau'][0]:.3g}.."
+              f"{found['plateau'][1]:.3g}, recommended "
+              f"{found['recommended']:.3g} dB; configured "
+              f"{rules.fan.stability_threshold:g} dB")
+        print(f"  leave-one-group-out ({fan_validation['groups']} "
+              f"groups): balanced {fan_validation['balancedAccuracy']:.3f}"
+              f" vs in-sample best {found['bestBalanced']:.3f}; chose "
+              f"{fan_validation['valuesChosen']['min']:.3g}.."
+              f"{fan_validation['valuesChosen']['max']:.3g}")
+        print(f"Compressor threshold: best {compressor_found['best']:g} "
+              f"dB, plateau {compressor_found['plateau'][0]:g}.."
+              f"{compressor_found['plateau'][1]:g}; configured "
+              f"{rules.compressor.threshold:g} dB")
+        print(f"  leave-one-group-out: balanced "
+              f"{compressor_validation['balancedAccuracy']:.3f} vs "
+              f"in-sample best {compressor_found['bestBalanced']:.3f}")
 
         search_summary = {
             "settingsTried": len(search.rows),
             "fastPathVerifiedEvents": checked,
-            "gate": {
+            "fan": {
                 "feature": feature,
                 **found,
-                "configured": rule.stability_threshold,
+                "configured": rules.fan.stability_threshold,
+                "leaveOneGroupOut": fan_validation,
+                "byFeature": feature_results,
             },
-            "byFeature": feature_results,
-            "leaveOneGroupOut": validation,
             "compressor": {
-                "configured": rule.compressor,
-                "best": best_compressor["compressor"],
-                "bestBalanced": best_compressor["balanced"],
+                **compressor_found,
+                "configured": rules.compressor.threshold,
+                "leaveOneGroupOut": compressor_validation,
             },
-            "topSeparatingFeatures": [
-                {"feature": r[0], "auc": r[2], "fanIs": r[1]}
-                for r in separation[:5]
-            ],
+            "topSeparatingFeatures": {
+                "fan": [
+                    {"feature": r[1], "auc": r[3], "presentIs": r[2]}
+                    for r in fan_separation[:5]
+                ],
+                "compressor": [
+                    {"feature": r[1], "auc": r[3], "presentIs": r[2]}
+                    for r in compressor_separation[:5]
+                ],
+            },
         }
 
         if not args.no_plots:
@@ -1028,8 +1204,30 @@ def main(argv: list[str] | None = None) -> int:
                 else args.out / "fan_stability_threshold.png"
             )
             plot_sweep(plot_path, sweep, feature, found["recommended"],
-                       v1_summary)
+                       v1_fan)
             print(f"Plot: {plot_path}")
+
+    # ---- beeps across every event -----------------------------------------
+    beeps = None
+
+    if "v2" in wanted and not args.no_beeps:
+        beeps = beep_summary(records, cache, configs["v2"].beep_config())
+
+        print(f"\nBeeps: {beeps['beeps']} found in "
+              f"{beeps['minutesOfAudio']:.0f} minutes of event audio")
+        print(table(
+            [
+                [kind, str(v["events"]), str(v["withBeep"])]
+                for kind, v in beeps["byTransition"].items()
+            ],
+            ["reviewed as", "events", "with a beep"],
+        ))
+
+        for kind, v in beeps["beforePublishedTransition"].items():
+            print(f"  {kind}: {v['count']} beeps "
+                  f"{-v['medianSeconds']:.2f} s before the published "
+                  f"transition (range {-v['maxSeconds']:.2f}.."
+                  f"{-v['minSeconds']:.2f} s)")
 
     # ---- summary ---------------------------------------------------------------
     summary = {
@@ -1039,6 +1237,10 @@ def main(argv: list[str] | None = None) -> int:
             "warmupSeconds": args.warmup,
             "guardSeconds": args.guard,
             "groupGapSeconds": args.group_gap,
+            "truthAssumption": (
+                "compressor runs only while the fan does: "
+                "OFF=(no,no) FAN=(yes,no) COMPRESSOR=(yes,yes)"
+            ),
         },
         "dataset": {
             **counts,
@@ -1050,8 +1252,8 @@ def main(argv: list[str] | None = None) -> int:
             version: {
                 "config": configs[version].to_api(),
                 "configSource": sources[version],
-                "published": ev.metrics(matrices[version]),
-                "candidate": ev.metrics(candidate_matrices[version]),
+                "published": observation_metrics(published[version]),
+                "candidate": observation_metrics(candidate[version]),
             }
             for version in wanted
         },
@@ -1059,6 +1261,7 @@ def main(argv: list[str] | None = None) -> int:
             {"v1CodeDefault": reference} if reference is not None else None
         ),
         "search": search_summary,
+        "beeps": beeps,
         "seconds": round(time.perf_counter() - started, 1),
     }
 
@@ -1068,24 +1271,32 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if len(wanted) == 2:
-        one, two = (ev.metrics(matrices[v]) for v in ("v1", "v2"))
+        one = observation_metrics(published["v1"])
+        two = observation_metrics(published["v2"])
 
         def change(before: int, after: int) -> str:
             if not before:
                 return "n/a"
             return f"{(after - before) / before:+.0%}"
 
-        print("\nv1 -> v2, window level, published state")
-        print(f"  OFF -> FAN          {one['offToFan']:6d} -> "
-              f"{two['offToFan']:6d}  ({change(one['offToFan'], two['offToFan'])})")
-        print(f"  FAN recall          {pct(one['recall']['FAN'])} -> "
-              f"{pct(two['recall']['FAN'])}")
-        print(f"  FAN -> OFF          {one['fanToOff']:6d} -> "
-              f"{two['fanToOff']:6d}")
-        print(f"  COMPRESSOR recall   {pct(one['recall']['COMPRESSOR'])} -> "
-              f"{pct(two['recall']['COMPRESSOR'])}")
-        print(f"  balanced accuracy   {one['balancedAccuracy']:.3f} -> "
-              f"{two['balancedAccuracy']:.3f}")
+        print("\nv1 -> v2, window level, published")
+
+        for observation in ev.OBSERVATIONS:
+            a, b = one[observation], two[observation]
+            print(f"  {observation}:")
+            print(f"    reported but not running  {a['falsePositive']:6d} -> "
+                  f"{b['falsePositive']:6d}  "
+                  f"({change(a['falsePositive'], b['falsePositive'])})")
+            print(f"    running but not reported  {a['falseNegative']:6d} -> "
+                  f"{b['falseNegative']:6d}  "
+                  f"({change(a['falseNegative'], b['falseNegative'])})")
+            print(f"    recall                    {pct(a['recall'])} -> "
+                  f"{pct(b['recall'])}")
+            print(f"    specificity               "
+                  f"{pct(a['specificity'])} -> {pct(b['specificity'])}")
+            print(f"    balanced accuracy         "
+                  f"{a['balancedAccuracy']:.3f} -> "
+                  f"{b['balancedAccuracy']:.3f}")
 
     print(f"\nWrote {args.out}")
     print()

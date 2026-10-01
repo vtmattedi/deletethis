@@ -154,3 +154,54 @@ def write_wav(path: Path, samples: np.ndarray) -> None:
         handle.setsampwidth(4)
         handle.setframerate(SAMPLE_RATE)
         handle.writeframes(data.tobytes())
+
+
+# ---------------------------------------------------------------------
+# Beeps
+# ---------------------------------------------------------------------
+
+# The unit's acknowledgement tone as recorded: a pure tone near 4.12 kHz
+# of about 150 ms, around -56 dBFS in its band, over whatever the room
+# is doing. 20*log10(A/sqrt(2)) = -56 gives A of about 0.0036.
+BEEP_HZ = 4120.0
+BEEP_AMPLITUDE = 0.0036
+
+
+def tone(
+    n: int,
+    start: float,
+    duration: float,
+    hz: float = BEEP_HZ,
+    amplitude: float = BEEP_AMPLITUDE,
+    attack: float = 0.004,
+    decay: float = 0.004,
+) -> np.ndarray:
+    """A tone burst with short ramps so it does not click."""
+    out = np.zeros(n)
+    first = int(start * SAMPLE_RATE)
+    length = int(duration * SAMPLE_RATE)
+    last = min(n, first + length)
+
+    if last <= first:
+        return out
+
+    t = np.arange(last - first) / SAMPLE_RATE
+    envelope = np.ones(last - first)
+
+    ramp_in = max(1, int(attack * SAMPLE_RATE))
+    ramp_out = max(1, int(decay * SAMPLE_RATE))
+    envelope[:ramp_in] = np.linspace(0, 1, ramp_in)
+    envelope[-ramp_out:] = np.minimum(
+        envelope[-ramp_out:], np.linspace(1, 0, ramp_out)
+    )
+
+    out[first:last] = amplitude * envelope * np.sin(2 * np.pi * hz * t)
+
+    return out
+
+
+def with_noise(signal: np.ndarray, sigma: float = 0.0004, seed: int = 3):
+    """The room under the signal."""
+    rng = np.random.default_rng(seed)
+
+    return signal + sigma * rng.standard_normal(signal.size)

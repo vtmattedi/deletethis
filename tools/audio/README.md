@@ -16,7 +16,9 @@ pip install -r tools/audio/requirements.txt
 ```
 
 `fastapi` and `uvicorn` are only needed for `backend/`; the
-command-line tools work without them.
+command-line tools work without them. `compare_models.py` additionally
+needs scikit-learn (`pip install -r tools/audio/requirements-analysis.txt`);
+the backend and the Docker image deliberately do not.
 
 ### Docker Compose
 
@@ -311,6 +313,191 @@ is ~1.4 dB for a fan and ~9.8 dB for speech, which separates the
 failing case far better than any level does. Spectral tilt
 (1500–4000 minus 200–1200) does **not** work — it is at chance.
 
+## Classifier versions
+
+```
+v1   30-80 Hz high -> COMPRESSOR; else 500-1k and 1k-2k high -> FAN; else OFF
+v2   the same, but FAN also needs a *stationary* fan spectrum
+```
+
+v1 is frozen. It is the baseline, and the rule the events recorded
+before v2 were classified by; a regression test replays today's
+Smoother against a verbatim copy of the old one and requires identical
+output, window for window.
+
+**Why v2.** Fan *energy* cannot tell a fan from speech, a printer or a
+television: all of them put real power in 500-1k and 1k-2k. What a fan
+does that they do not is hold still. Over two seconds its band level
+barely moves; speech and machinery keep changing. v2 adds one test,
+`1k-2k_std <= fanStabilityThreshold` (the standard deviation of that
+band's level over the last two seconds), and requires at least
+`fanStabilityMinSeconds` of history behind it, because a standard
+deviation over two windows is near zero and would make anything look
+stationary. This is **not** `holdSeconds`: the hold stops a short-lived
+candidate being *published*, stationarity says what the signal *is*,
+and a printer that runs for ten seconds outlasts any hold short enough
+to be useful.
+
+### Where things are stored
+
+Each version keeps its events, history and saved settings in its own
+folder, and the two never share one:
+
+| | v1 | v2 |
+| --- | --- | --- |
+| events | `results/events/` | `results/v2/events/` |
+| history | `results/audio.db` | `results/v2/audio.db` |
+| settings | `results/config.json` | `results/v2/config.json` |
+| evaluation, plots | | `results/v2/evaluation/`, `results/v2/plots/` |
+
+The v1 events are the labelled evidence v2 is judged against; a v2 run
+that added its own to that folder would change the baseline it is being
+compared with, and nothing would show it. So `AppConfig` refuses the
+mix (v2 pointed at a v1 path, or v1 at a v2 path) instead of trusting
+everyone to remember. Switching version is a restart, never a setting,
+and a saved settings file is never reinterpreted across versions — one
+with no version key predates versions and is v1.
+
+The v1 events are never modified, migrated or renamed. A v2 backend
+starts with an empty event list; run `--classifier v1` to browse the old
+ones. **With Docker Compose the default is now v2**, so the container
+writes to `results/v2/`; add `--classifier`, `v1` to its `command` to
+keep growing the v1 dataset.
+
+`classify_live.py --classifier v1|v2` selects the same rules for the
+command-line tool (default v1, which is what it always did).
+
+### v2 settings
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `fanStabilityFeature` | `1k-2k_std` | which temporal feature must stay small |
+| `fanStabilityThreshold` | `6.0` dB | largest value still read as a steady fan |
+| `fanStabilityMinSeconds` | `1.0` | history needed before the gate trusts it |
+
+Every event records `classifierVersion` and the exact config in force.
+Events from before versions existed carry neither and count as v1.
+The live panel shows the fan-stability value against its limit (green
+when steady), and an event's detail page shows the stationarity
+features at the transition.
+
+### Evaluating against reviewed events
+
+```
+python tools/audio/evaluate_events.py tools/audio/results/events
+python tools/audio/evaluate_events.py tools/audio/results/events --classifier v2
+```
+
+Replays each reviewed event's WAV through the same extractor, rule and
+Smoother the backend uses, and scores the published state against what
+the reviewer said was happening. **Ground truth is
+`review.actualFrom` / `review.actualTo` and nothing else** — the
+classifier's own `from` / `to` are what is being tested. Unreviewed and
+`UNKNOWN` events are counted in the summary but never scored. The input
+can be events from either version; output always goes to
+`results/v2/evaluation/`.
+
+A window is scored only where its label can be trusted: the first 5 s
+(replay starts cold) and 4 s either side of a real transition (the
+audio changed somewhere inside it) are skipped. Windows in one event
+are near-copies and neighbouring events overlap in time, so anything
+chosen from the data is validated **by group** — events within 120 s of
+each other — never by window.
+
+| File | What it holds |
+| --- | --- |
+| `summary.json` | parameters, dataset counts, headline metrics, search result |
+| `confusion_v1.csv`, `confusion_v2.csv` | window-level confusion matrices |
+| `per_event.csv` | every event, v1 and v2 side by side, with the difference |
+| `per_interference.csv` | recall per truth class per interference tag |
+| `feature_separation.csv` | which features tell FAN from OFF at all |
+| `candidate_thresholds.csv` | every setting the search tried |
+
+The threshold search needs thousands of trials, so it uses a vectorised
+path rather than the Smoother's Python loop. It does not reimplement the
+rule — `classify_v2_codes` is written once and runs on scalars (live) or
+arrays (search) — and the plumbing it does duplicate (rolling median,
+hold) is checked against the real Smoother window for window on every
+run. With the gate disabled v2 reproduces v1 exactly, which a test pins.
+
+### What the evidence says (88 reviewed events, 2026-10-01)
+
+53,014 scored windows in 63 groups; published state, window level:
+
+| | v1 (as run live) | v2 |
+| --- | --- | --- |
+| OFF called FAN | 2438 | **1160** (-52%) |
+| FAN recall | 100.0% | 98.6% |
+| FAN called OFF | 0 | 188 |
+| COMPRESSOR recall | 95.5% | 95.5% |
+| balanced accuracy | 0.934 | **0.951** |
+
+**The gate threshold was chosen from the data, and it is far looser than
+the plan's starting guess.** Below about 2 dB FAN recall collapses —
+1.2-1.5 dB loses 20-30% of real fan windows, because a real fan moves
+a little. From about 4 to 6 dB OFF→FAN stays flat at its floor while
+FAN recall climbs to 98.6%, so a tighter gate buys nothing there. Above
+6.1 dB false FAN grows again. The plateau within 0.005 of the best is
+4.9-7.0 dB; 6.0 is its centre. Choosing the threshold from 62 groups
+and testing it on the held-out one gives the same 0.951, so the figure
+is not an artefact of tuning it on the data it is scored on. Going
+tighter than ~5 dB is a trade of real fans for false ones, not a free
+improvement, and is yours to make: `candidate_thresholds.csv` has the
+curve.
+
+Things to know before trusting it:
+
+* **Thresholds belong to an installation, not to the rule.** The code
+  default for v1's compressor threshold is -48 dB, tuned on the first
+  recordings. In the newer sessions the OFF-state 30-80 level has a
+  median of -48.7 dB, so at -48 v1 calls 34% of OFF windows COMPRESSOR
+  (balanced accuracy 0.755); the live system had already been moved to
+  -38 for this reason (91 of the first 125 events were recorded at
+  it), and v2 defaults to that value. The reverse also holds: on the
+  original 29 recordings the compressor sits at about -38 dB itself, so
+  v2 at -38 reads only 43% of the clean compressor files correctly. Re-
+  run the evaluation when the microphone moves.
+* **A stationarity gate costs some FAN-under-noise, and the tighter
+  it is the more.** Speech or television over a running fan raises the
+  fan's band variation, so the gate can read "fan + noise" as
+  not-a-fan. On the original recordings `FAN / talking` is 100% under
+  v1 and 83% under v2 at the shipped 6 dB (it was 3% at the 2 dB I
+  first tried). The reviewed events have too little to measure it
+  properly: about 530 FAN windows with interference, where the printer
+  ones are all kept and the single television event (188 windows) is
+  lost entirely. If the air conditioner must be detected reliably while
+  people talk over it, expect to need a different feature as well.
+* **The residual false FAN is concentrated.** One event (`OFF` all the
+  way through, tagged "other") accounts for 470 of the 1160 remaining
+  OFF→FAN windows, and three events for 69%. That is a steady non-AC
+  sound sitting in both fan bands — worth listening to, and not
+  something a variance test can remove.
+* The labelled set is small (88 events, 15 of them OFF with
+  interference). Differences of a point or two are noise.
+
+### Do models do better?
+
+```
+python tools/audio/compare_models.py tools/audio/results/events
+```
+
+Fits logistic regression, shallow decision trees and a small random
+forest on the same reviewed events and scores them next to v1 and v2 —
+same inputs, same publication hold, folds split by group. It is
+analysis only: nothing in the backend imports it or scikit-learn.
+A model has to beat the rule by 0.02 balanced accuracy before it is
+worth discussing, and if a shallow tree comes close, the right move is
+to read its splits and fold them into the rule.
+
+On this data nothing does: the best, a depth-3 tree, scores 0.956
+against the rule's 0.951, and the forest 0.955 with fewer false FANs
+but 2 points worse COMPRESSOR recall. The trees' FAN branch splits on
+`1k-2k_minus_500-1k` (the spectral tilt between the two fan bands)
+rather than on stationarity, and `feature_separation.csv` ranks that
+feature third on its own. It is the obvious next candidate to combine
+with the gate if the remaining false FAN matters — not something to add
+without testing it the same way.
+
 ## Backend and web UI
 
 ```
@@ -320,9 +507,13 @@ python tools/audio/backend/app.py --target 192.168.1.50:3333
 ```
 Backend starting
 ESP32: 192.168.1.50:3333
+Classifier: v2   results: tools/audio/results/v2
 stream: connected to 192.168.1.50:3333 (16000 Hz, 512 samples/frame)
 Web: http://127.0.0.1:8000
 ```
+
+`--classifier v1|v2` chooses the classifier (default **v2**) and, with
+it, where everything is stored: see [Classifier versions](#classifier-versions).
 
 A long-running local service that is **the only TCP client** the ESP32
 has. It owns reception, feature extraction, classification, runtime
@@ -358,8 +549,9 @@ stream, event WAVs and classifier input remain unchanged. Use
 headphones to prevent speaker-to-microphone feedback.
 
 `PATCH /api/config` atomically saves the complete validated settings to
-`results/config.json` and applies them without touching the TCP
-connection. The backend loads that file on its next start. The
+the running version's `config.json` (`results/config.json` for v1,
+`results/v2/config.json` for v2) and applies them without touching the
+TCP connection. The backend loads that file on its next start. The
 published state is kept — moving a threshold is not an observation —
 but the rolling median and candidate are cleared, so the hold has to be
 earned again under the new rules.
@@ -485,8 +677,13 @@ that point, not the Arduino library that was there before.
 | `capture.py` | serial -> WAV |
 | `visualize.py` | live plots and classifier |
 | `analyze.py` | WAV -> feature tables and plots |
-| `classify_live.py` | serial -> live OFF / FAN / COMPRESSOR |
+| `classify_live.py` | serial -> live OFF / FAN / COMPRESSOR (`--classifier v1|v2`) |
+| `features.py` | the one DSP implementation every other tool imports |
+| `classifier/` | the rules (`v1.py`, `v2.py`) and the shared Smoother (`common.py`) |
+| `evaluation.py`, `evaluate_events.py` | replay reviewed events and score both classifiers |
+| `compare_models.py` | analysis only: do learned models beat the rule? |
 | `recordings/` | captured WAVs, the inputs (git-ignored except `.gitkeep`) |
 | `backend/` | the local service: stream, classifier, config, events, API |
 | `web/` | the browser UI it serves |
-| `results/` | everything generated: `events/`, `plots/`, `features.csv`, … |
+| `results/` | everything generated: v1 `events/`, `audio.db`, `config.json`, … |
+| `results/v2/` | the same for v2, plus `evaluation/` and `plots/` |

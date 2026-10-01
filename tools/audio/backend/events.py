@@ -10,6 +10,19 @@ no filtering. The JSON is a compact summary of what the classifier
 believed at that moment and under which settings, not a dump of
 every window.
 
+What counts as an event depends on the classifier version. Under v1 it
+is a change of the single published state. Under v2, which reports
+independent observations, an event is one of:
+
+    fan on / fan off                 (FAN_ON, FAN_OFF)
+    compressor on / compressor off   (COMPRESSOR_ON, COMPRESSOR_OFF)
+    a beep                           (BEEP)
+    a manual capture                 (MANUAL)
+
+Each is named for what happened, carries ``eventType``, and records the
+observations as they stood. The schemas differ but v1 events stay
+readable: v2 only adds keys.
+
 One thing to know about the pre-roll: a transition is published
 hold_seconds + roughly median_seconds AFTER the audio actually
 changed, so that much of the pre-roll is already the new state. The
@@ -54,6 +67,125 @@ def event_timeline(
     overlap: float = 0.5,
 ) -> dict:
     """Recompute the feature timeline from an event's audio.
+
+    Dispatches on the classifier version recorded with the event.
+    """
+    if config.version == "v2":
+        return _observation_timeline(
+            wav_path, config, pre_seconds, nfft, overlap
+        )
+
+    return _state_timeline(wav_path, config, pre_seconds, nfft, overlap)
+
+
+def _observation_timeline(
+    wav_path: Path,
+    config: ClassifierConfig,
+    pre_seconds: float,
+    nfft: int = 1024,
+    overlap: float = 0.5,
+) -> dict:
+    """The v2 timeline: fan and compressor over time, and the beeps.
+
+    The smoother starts cold, so the published observations near the
+    left edge are still warming up; the candidates and the features are
+    exact. Beeps use the raw windows, as they do live.
+    """
+    from scipy.io import wavfile
+
+    from acstream import FULL_SCALE
+    from analyze import to_float
+    from classifier.common import ObservationSmoother
+    from classifier.detectors import BeepDetector
+    from features import FEATURE_NAMES, FeatureExtractor
+
+    sample_rate, raw = wavfile.read(wav_path)
+    signal = to_float(raw) * FULL_SCALE
+
+    extractor = FeatureExtractor(sample_rate, nfft, overlap)
+    hop_seconds = extractor.hop / sample_rate
+
+    smoother = ObservationSmoother(
+        config.rule(),
+        window_rate=sample_rate / extractor.hop,
+        median_seconds=config.median_seconds,
+        hold_seconds=config.hold_seconds,
+    )
+    beeps = BeepDetector(
+        config.beep_config(),
+        hop_seconds=hop_seconds,
+        window_seconds=nfft / sample_rate,
+    )
+
+    columns: dict[str, list] = {
+        "t": [],
+        "fan": [],
+        "compressor": [],
+        "fanCandidate": [],
+        "compressorCandidate": [],
+        # The old single state, derived, so the existing strip works.
+        "state": [],
+        "candidate": [],
+        "beepContrast": [],
+    }
+
+    for name in FEATURE_NAMES:
+        columns[name] = []
+
+    found = []
+    chunk = 512
+
+    for start in range(0, signal.size - chunk + 1, chunk):
+        for features in extractor.push(signal[start : start + chunk]):
+            decision = smoother.update(features)
+            found.extend(beeps.update(features))
+
+            columns["t"].append(round(features.time - pre_seconds, 3))
+            columns["fan"].append(decision.fan_detected)
+            columns["compressor"].append(decision.compressor_detected)
+            columns["fanCandidate"].append(decision.fan_candidate)
+            columns["compressorCandidate"].append(
+                decision.compressor_candidate
+            )
+            columns["state"].append(decision.legacy_state())
+            columns["candidate"].append(decision.legacy_candidate())
+            columns["beepContrast"].append(
+                round(features.diagnostics["beep_contrast_db"], 2)
+            )
+
+            for name in FEATURE_NAMES:
+                columns[name].append(round(decision.values[name], 6))
+
+    found.extend(beeps.flush())
+
+    return {
+        "classifierVersion": "v2",
+        "sampleRate": sample_rate,
+        "nfft": nfft,
+        "overlap": overlap,
+        "preSeconds": pre_seconds,
+        "count": len(columns["t"]),
+        "columns": columns,
+        "beeps": [
+            {
+                **beep.to_api(),
+                # Relative to the event, like the time axis.
+                "startSeconds": round(beep.start_time - pre_seconds, 3),
+                "endSeconds": round(beep.end_time - pre_seconds, 3),
+            }
+            for beep in found
+        ],
+    }
+
+
+def _state_timeline(
+    wav_path: Path,
+    config: ClassifierConfig,
+    pre_seconds: float,
+    nfft: int = 1024,
+    overlap: float = 0.5,
+) -> dict:
+    """Recompute the v1 feature timeline from an event's audio.
 
     Derived on demand rather than stored, so the JSON stays a decision
     summary and the WAV stays the only copy of the evidence. It also
@@ -131,8 +263,8 @@ class PendingEvent:
     identifier: str
     started: datetime
 
-    from_state: str | None
-    to_state: str
+    from_state: object
+    to_state: object
 
     stable_seconds: float
     stream_time: float
@@ -141,6 +273,11 @@ class PendingEvent:
     decision_window: dict[str, dict[str, float]]
     classifier_config: dict
     source: str = "transition"
+
+    # v2: what kind of event, and anything specific to it (the
+    # observations at the time, a beep's measurements).
+    event_type: str | None = None
+    extra: dict = field(default_factory=dict)
 
     chunks: list[np.ndarray] = field(default_factory=list)
     collected: int = 0
@@ -175,6 +312,10 @@ class EventRecorder:
 
         self.pending: list[PendingEvent] = []
         self.written: list[dict] = []
+
+        # Set by the stream service: given a span of wall-clock time,
+        # the commands the operator said they sent in it.
+        self.command_lookup = None
 
         self.directory.mkdir(parents=True, exist_ok=True)
 
@@ -285,23 +426,37 @@ class EventRecorder:
 
     def start(
         self,
-        from_state: str | None,
-        to_state: str,
+        from_state: object,
+        to_state: object,
         stable_seconds: float,
         stream_time: float,
         features: dict[str, float],
         decision_window: dict[str, dict[str, float]],
         classifier_config: ClassifierConfig,
         source: str = "transition",
+        *,
+        event_type: str | None = None,
+        identifier_suffix: str | None = None,
+        extra: dict | None = None,
     ) -> str:
+        """Begin capturing an event.
+
+        v1 events are named ``FROM_to_TO``. v2 events pass
+        ``identifier_suffix`` (``FAN_ON``, ``BEEP``, ...) and
+        ``event_type`` instead, and anything particular to the event
+        in ``extra``, which is merged into its metadata.
+        """
         if self.sample_rate is None:
             raise RuntimeError("sample rate is not known yet")
         now = datetime.now()
 
-        base_identifier = (
-            f"{now:%Y-%m-%d_%H%M%S}_"
-            f"{from_state or 'NONE'}_to_{to_state}"
-        )
+        if identifier_suffix:
+            base_identifier = f"{now:%Y-%m-%d_%H%M%S}_{identifier_suffix}"
+        else:
+            base_identifier = (
+                f"{now:%Y-%m-%d_%H%M%S}_"
+                f"{from_state or 'NONE'}_to_{to_state}"
+            )
 
         with self.lock:
             identifier = base_identifier
@@ -326,6 +481,8 @@ class EventRecorder:
                 decision_window=decision_window,
                 classifier_config=classifier_config.to_api(),
                 source=source,
+                event_type=event_type,
+                extra=dict(extra or {}),
                 chunks=pre,
                 collected=0,
                 wanted=int(
@@ -358,6 +515,16 @@ class EventRecorder:
 
         pre_actual = max(0, samples.size - event.collected)
 
+        v2_keys = {}
+
+        if event.event_type:
+            v2_keys = {"eventType": event.event_type, **event.extra}
+
+            context = self._command_context(event)
+
+            if context:
+                v2_keys["commandContext"] = context
+
         metadata = {
             "id": event.identifier,
             # Which classifier produced this event's from/to, and under
@@ -389,6 +556,7 @@ class EventRecorder:
             },
             "decisionWindow": event.decision_window,
             "classifierConfig": event.classifier_config,
+            **v2_keys,
             "review": {"status": "unreviewed"},
         }
 
@@ -398,6 +566,39 @@ class EventRecorder:
             self.written.append(metadata)
 
         return metadata
+
+    # How far from an event a command can be and still be its context.
+    COMMAND_WINDOW_SECONDS = 10.0
+
+    def _command_context(self, event: PendingEvent) -> dict | None:
+        """The command the operator recorded nearest this event, if any.
+
+        Matched on wall-clock time, by distance from the moment the event
+        was triggered: the stream clock restarts with the process, so it
+        cannot be compared across a restart. Watson only attaches the
+        fact; whether it explains the event is the reader's (or the
+        controller's) call.
+        """
+        if self.command_lookup is None:
+            return None
+
+        trigger = event.started.timestamp()
+        window = self.COMMAND_WINDOW_SECONDS
+        commands = self.command_lookup(trigger - window, trigger + window)
+
+        if not commands:
+            return None
+
+        nearest = min(commands, key=lambda c: abs(c["time"] - trigger))
+
+        return {
+            "command": nearest["command"],
+            # Stream seconds, like the beep's own timestamps.
+            "sentAt": nearest["streamSeconds"],
+            "expectedBeep": nearest["expectedBeep"],
+            "secondsFromEvent": round(nearest["time"] - trigger, 2),
+            "note": nearest.get("note", ""),
+        }
 
     def list_events(
         self,
@@ -433,9 +634,16 @@ class EventRecorder:
             else "correct" if review.get("classificationCorrect")
             else "incorrect"
         )
+        observations = metadata.get("observations") or {}
         values = [
             metadata.get("id"), metadata.get("time"),
             metadata.get("from"), metadata.get("to"),
+            metadata.get("eventType"),
+            *(
+                f"{name}:{'on' if state else 'off'}"
+                for name, state in observations.items()
+                if state is not None
+            ),
             metadata.get("source"), review.get("status"),
             review.get("actualFrom"), review.get("actualTo"),
             review.get("notes"),
@@ -494,6 +702,45 @@ class EventRecorder:
                 metadata["review"] = updated_review
 
             return [dict(metadata) for metadata, *_rest in pending], []
+
+    def annotate(self, identifier: str, fields: dict) -> dict | None:
+        """Set (or, with None, remove) top-level keys on an event.
+
+        For facts about the event that are not part of the review, such
+        as the command that was sent near it. The JSON is replaced
+        atomically, like a review.
+        """
+        with self.lock:
+            metadata = next(
+                (
+                    item for item in self.written
+                    if item.get("id") == identifier
+                ),
+                None,
+            )
+
+            if metadata is None:
+                return None
+
+            path = self._event_path(identifier, ".json")
+
+            if path is None:
+                return None
+
+            updated = dict(metadata)
+
+            for key, value in fields.items():
+                if value is None:
+                    updated.pop(key, None)
+                else:
+                    updated[key] = value
+
+            self._write_json_atomic(path, updated)
+
+            metadata.clear()
+            metadata.update(updated)
+
+            return dict(metadata)
 
     def delete(self, identifier: str) -> bool:
         """Delete one completed event's self-contained JSON/WAV pair."""

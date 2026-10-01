@@ -78,6 +78,35 @@ FEATURE_NAMES = (
     + TEMPORAL_FEATURES
 )
 
+# The air conditioner acknowledges a remote command with a short, pure
+# tone. In the recorded events it sits at 4118-4123 Hz and lasts
+# 64-160 ms. A tone is recognised by how far it stands above the
+# spectrum on either side of it, not by how loud it is: the same ear
+# hears a door slam or a voice at far higher volume. At 16 kHz / 1024
+# that is 15.6 Hz per bin, plenty to place a tone this narrow.
+#
+#       3850-4000   4050-4180   4230-4380
+#        lower        TONE        upper
+#       neighbour               neighbour
+BEEP_TONE_HZ = (4050.0, 4180.0)
+BEEP_LOWER_HZ = (3850.0, 4000.0)
+BEEP_UPPER_HZ = (4230.0, 4380.0)
+
+# Where to look for the tone's peak: the tone band and both neighbours.
+# A peak that lands outside the tone band is not this beep, however
+# sharp it is.
+BEEP_SEARCH_HZ = (3850.0, 4380.0)
+
+# Added to every window's diagnostics, and so to ``Features.values``,
+# but kept out of FEATURE_NAMES: that list fixes the columns of every
+# CSV and event JSON, which these would only widen with zeros.
+BEEP_FEATURES = [
+    "beep_band_power",        # dB, power in the tone band
+    "beep_peak_hz",           # Hz, interpolated peak in the search region
+    "beep_neighbor_power",    # dB, the louder of the two neighbour bands
+    "beep_contrast_db",       # tone band minus neighbours
+]
+
 # Bookkeeping rather than a measurement, so deliberately NOT part of
 # FEATURE_NAMES (which fixes the columns of every CSV and event JSON).
 # It is how many seconds of history the *_std values above are
@@ -110,6 +139,71 @@ def window_power(block: np.ndarray, window: np.ndarray) -> np.ndarray:
     else:
         power[1:] *= 2.0
     return power
+
+
+def _band_mask(freqs: np.ndarray, edges: tuple[float, float]) -> np.ndarray:
+    """Bins in [low, high), the convention every band here uses."""
+    return (freqs >= edges[0]) & (freqs < edges[1])
+
+
+def beep_features(
+    power: np.ndarray,
+    freqs: np.ndarray,
+    tone: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    search_bins: np.ndarray,
+    bin_hz: float,
+) -> dict[str, float]:
+    """The four beep diagnostics for one window's power spectrum.
+
+    Returns floor values when the spectrum does not reach the beep
+    region (a very low sample rate), so the keys always exist.
+    """
+    floor = {
+        "beep_band_power": DB_FLOOR,
+        "beep_peak_hz": 0.0,
+        "beep_neighbor_power": DB_FLOOR,
+        "beep_contrast_db": 0.0,
+    }
+
+    if not (tone.any() and lower.any() and upper.any()):
+        return floor
+
+    band_db = float(power_to_db(float(power[tone].sum())))
+    neighbour_db = float(power_to_db(max(
+        float(power[lower].sum()), float(power[upper].sum())
+    )))
+
+    peak_hz = 0.0
+    segment = power[search_bins]
+
+    if segment.size and float(segment.max()) > np.finfo(np.float64).tiny:
+        bin_index = int(search_bins[int(np.argmax(segment))])
+        peak_hz = bin_index * bin_hz
+
+        # Sharpen the estimate with a parabola through the log power of
+        # the peak bin and its neighbours. A Hamming-windowed tone
+        # spreads over a few bins and its log spectrum is close to
+        # parabolic there, which places it to a fraction of a bin.
+        if 0 < bin_index < power.size - 1:
+            tiny = np.finfo(np.float64).tiny
+            a = np.log(power[bin_index - 1] + tiny)
+            b = np.log(power[bin_index] + tiny)
+            c = np.log(power[bin_index + 1] + tiny)
+            curvature = a - 2.0 * b + c
+
+            if curvature < -1e-12:
+                offset = 0.5 * (a - c) / curvature
+                peak_hz = (bin_index + float(np.clip(offset, -1.0, 1.0))) \
+                    * bin_hz
+
+    return {
+        "beep_band_power": band_db,
+        "beep_peak_hz": peak_hz,
+        "beep_neighbor_power": neighbour_db,
+        "beep_contrast_db": band_db - neighbour_db,
+    }
 
 
 @dataclass
@@ -151,6 +245,12 @@ class FeatureExtractor:
             (self.freqs >= PEAK_MIN_HZ)
             & (self.freqs <= PEAK_MAX_HZ)
         )
+        self.beep_tone_mask = _band_mask(self.freqs, BEEP_TONE_HZ)
+        self.beep_lower_mask = _band_mask(self.freqs, BEEP_LOWER_HZ)
+        self.beep_upper_mask = _band_mask(self.freqs, BEEP_UPPER_HZ)
+        self.beep_search_bins = np.where(
+            _band_mask(self.freqs, BEEP_SEARCH_HZ)
+        )[0]
         self.spectral_mask = (
             (self.freqs >= SPECTRAL_MIN_HZ)
             & (self.freqs <= SPECTRAL_MAX_HZ)
@@ -248,6 +348,12 @@ class FeatureExtractor:
                 bands["1500-4000"] - bands["200-1200"]
             ),
         }
+
+        diagnostics.update(beep_features(
+            power, self.freqs, self.beep_tone_mask, self.beep_lower_mask,
+            self.beep_upper_mask, self.beep_search_bins,
+            self.sample_rate / self.nfft,
+        ))
 
         current = {"rms": rms_db, **bands, **diagnostics}
         self.temporal_history.append(current)

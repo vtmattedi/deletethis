@@ -34,6 +34,13 @@ HISTORY_ADDITIONS = {
     "band_1k_2k_std": "REAL",
     "spectral_flux": "REAL",
     "spectral_flatness": "REAL",
+    # Classifier v2 observations. NULL under v1 and before anything has
+    # been published. Stored as 0/1; a downsampled range averages them
+    # into the fraction of that bucket the observation was on.
+    "fan_detected": "INTEGER",
+    "compressor_detected": "INTEGER",
+    # Cumulative beeps since the backend started.
+    "beep_count": "INTEGER",
 }
 
 # stream_connected is gone: rows are only written while audio is
@@ -49,6 +56,9 @@ COLUMNS = [
     *BAND_COLUMNS.values(),
     "lost_frames",
     "device_dropped",
+    "fan_detected",
+    "compressor_detected",
+    "beep_count",
 ]
 
 # Averaged when a bucket covers several rows.
@@ -56,10 +66,12 @@ NUMERIC_COLUMNS = [
     "stable_seconds",
     "rms",
     *BAND_COLUMNS.values(),
+    "fan_detected",
+    "compressor_detected",
 ]
 
 # Cumulative counters: the largest in the bucket is the one that counts.
-COUNTER_COLUMNS = ["lost_frames", "device_dropped"]
+COUNTER_COLUMNS = ["lost_frames", "device_dropped", "beep_count"]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS history (
@@ -85,6 +97,17 @@ CREATE TABLE IF NOT EXISTS connection (
     t         REAL PRIMARY KEY,
     connected INTEGER,
     detail    TEXT
+);
+
+-- Commands the operator says were sent to the air conditioner, so that
+-- later analysis can ask how often a command was followed by a beep and
+-- how soon. Watson only records them; it does not act on them.
+CREATE TABLE IF NOT EXISTS commands (
+    t             REAL PRIMARY KEY,
+    stream_s      REAL,
+    command       TEXT,
+    expected_beep INTEGER,
+    note          TEXT
 );
 """
 
@@ -196,6 +219,7 @@ class HistoryStore:
             ],
             health.lost_frames,
             health.device_dropped,
+            *self._observations(snapshot),
         ]
 
         placeholders = ", ".join("?" * len(COLUMNS))
@@ -211,6 +235,68 @@ class HistoryStore:
         self.rows_written += 1
 
         return True
+
+    @staticmethod
+    def _observations(snapshot) -> list:
+        """fan, compressor, beeps: NULL where the classifier has none."""
+        def flag(value):
+            return None if value is None else int(bool(value))
+
+        return [
+            flag(getattr(snapshot, "fan_detected", None)),
+            flag(getattr(snapshot, "compressor_detected", None)),
+            getattr(snapshot, "beep_count", None),
+        ]
+
+    # ---------------------------------------------------- commands
+
+    def record_command(
+        self,
+        command: str,
+        expected_beep: bool,
+        stream_seconds: float,
+        note: str = "",
+    ) -> dict:
+        """Note that a command was sent now. Returns what was stored."""
+        moment = time.time()
+
+        with self.lock:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO commands "
+                "(t, stream_s, command, expected_beep, note) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (moment, stream_seconds, command,
+                 1 if expected_beep else 0, note),
+            )
+            self.connection.commit()
+
+        return {
+            "time": moment,
+            "streamSeconds": stream_seconds,
+            "command": command,
+            "expectedBeep": bool(expected_beep),
+            "note": note,
+        }
+
+    def commands_between(self, start: float, end: float) -> list[dict]:
+        """Commands with wall-clock time in [start, end], oldest first."""
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT t, stream_s, command, expected_beep, note "
+                "FROM commands WHERE t >= ? AND t <= ? ORDER BY t",
+                (start, end),
+            ).fetchall()
+
+        return [
+            {
+                "time": row["t"],
+                "streamSeconds": row["stream_s"],
+                "command": row["command"],
+                "expectedBeep": bool(row["expected_beep"]),
+                "note": row["note"] or "",
+            }
+            for row in rows
+        ]
 
     # -------------------------------------------------------- read
 

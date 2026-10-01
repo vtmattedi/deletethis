@@ -1,28 +1,49 @@
-"""Replay reviewed events through the live classifier and score them.
+"""Replay reviewed events through the live classifiers and score them.
 
 The question this answers is "would a different rule have called these
 real situations correctly?", asked of audio a person has already
 labelled. The inputs are the event WAVs the backend recorded and the
 ``review`` block a human filled in; nothing else is ground truth.
 
-    event WAV --> FeatureExtractor --> rule --> Smoother (median, hold)
-                                                    |
-                          review.actualFrom/To  ----+--> score
+    event WAV --> FeatureExtractor --> detectors --> smoothing + hold
+                                                         |
+                          review.actualFrom/To  ---------+--> score
 
-Two ways of running the rule, one rule
---------------------------------------
-``replay_exact`` feeds the real Smoother window by window. It is what
-the live backend does, and every number reported as a result comes from
-it.
+Observations, not a state
+-------------------------
+Watson v2 reports independent observations -- *is the fan running* and
+*is the compressor running* -- and not one combined state. So each is
+scored on its own, as a yes/no question with its own errors: a fan
+called running when it was not, a compressor missed when it was.
+
+The historical labels, though, are the old three-way ``OFF / FAN /
+COMPRESSOR``. To score the new observations against them, this module
+derives **compatibility truth**:
+
+    OFF         fan = no    compressor = no
+    FAN         fan = yes   compressor = no
+    COMPRESSOR  fan = yes   compressor = yes
+
+The assumption is that the compressor only runs while the fan is
+turning, which holds for this air conditioner. It is a stand-in so the
+old reviews remain usable evidence; it is *not* the review schema for
+v2, which labels each observation on its own. Where it matters: a
+"COMPRESSOR" window now counts against the fan detector if the fan is
+not detected, which the old scoring (where the compressor shadowed the
+fan) never exposed.
+
+Two ways of running the rules, one set of rules
+-----------------------------------------------
+``replay_v2`` feeds the real ObservationSmoother window by window. It is
+what the live backend does, and every reported result comes from it.
 
 ``FastEvaluator`` exists only so a threshold *search* is affordable: it
-has to try thousands of settings, and the Smoother is a Python loop.
-It does not reimplement the decision. The v2 rule is a single function
-(``classify_v2_codes``) written to accept scalars or arrays, so the
-search executes the same lines the live path does. What it does
-duplicate is the rolling median and the hold -- plumbing, not rules --
-and ``verify_fast_path`` checks it against the Smoother window for
-window, so a disagreement is a failing check rather than a quiet error.
+tries thousands of settings and the Smoother is a Python loop. It does
+not reimplement the detectors -- they are written once, on numpy
+booleans, and run on scalars (live) or arrays (search) alike. What it
+does duplicate is the rolling median and the hold, which are plumbing,
+and ``verify_fast_path`` checks them against the real thing window for
+window so a disagreement is a failing check, not a quiet error.
 
 Ground truth, and its limits
 ----------------------------
@@ -61,8 +82,16 @@ from scipy.io import wavfile
 import features as features_module
 from acstream import FULL_SCALE
 from analyze import to_float
-from classifier.common import STATES, Smoother
-from classifier.v2 import ThresholdsV2, classify_v2_codes
+from classifier.common import ObservationSmoother, Smoother
+from classifier.detectors import (
+    BeepConfig,
+    BeepDetector,
+    CompressorConfig,
+    FanConfig,
+    detect_compressor,
+    detect_fan,
+)
+from classifier.v2 import ObservationRules
 from features import (
     BAND_NAMES,
     FEATURE_NAMES,
@@ -89,12 +118,17 @@ DEFAULT_GUARD_SECONDS = 4.0
 # literal samples.
 DEFAULT_GROUP_GAP_SECONDS = 120.0
 
+# The historical three-way labels, and the independent observations
+# they are mapped onto.
 LABELS = ("OFF", "FAN", "COMPRESSOR")
 LABEL_CODE = {name: index for index, name in enumerate(LABELS)}
-UNSCORED = -1
-NO_STATE = 3                      # confusion column for "nothing published"
+OBSERVATIONS = ("fan", "compressor")
 
-CACHE_VERSION = 1
+UNSCORED = -1          # no trustworthy label for this window
+UNKNOWN = -1           # a classifier had nothing published yet
+NONE_COLUMN = 2        # confusion column for "nothing published"
+
+CACHE_VERSION = 2      # bumped when the cached columns changed
 
 
 # ---------------------------------------------------------------------
@@ -112,6 +146,7 @@ class EventRecord:
     metadata: dict
 
     classifier_version: str
+    event_type: str                  # "transition" for v1-style events
     reviewed: bool
     actual_from: str | None
     actual_to: str | None
@@ -123,7 +158,11 @@ class EventRecord:
 
     @property
     def labelled(self) -> bool:
-        """Has a usable ground truth."""
+        """Has a usable ground truth in the historical three-way scheme.
+
+        v2 events review each observation separately and carry no
+        ``actualFrom`` / ``actualTo``, so they are not scored here.
+        """
         return (
             self.reviewed
             and self.actual_from in LABEL_CODE
@@ -174,6 +213,7 @@ def parse_event(json_path: Path) -> EventRecord | None:
         metadata=metadata,
         # Events written before versions existed were classified by v1.
         classifier_version=metadata.get("classifierVersion", "v1"),
+        event_type=metadata.get("eventType", "transition"),
         reviewed=reviewed,
         actual_from=review.get("actualFrom") if reviewed else None,
         actual_to=review.get("actualTo") if reviewed else None,
@@ -201,16 +241,26 @@ def load_events(directories: Iterable[Path]) -> list[EventRecord]:
 def dataset_counts(records: list[EventRecord]) -> dict:
     """What is in the dataset, including everything that is not scored."""
     labelled = [r for r in records if r.labelled]
+    observation_events = [
+        r for r in records if r.classifier_version == "v2"
+        and r.event_type != "transition"
+    ]
     unknown = [
         r for r in records
-        if r.reviewed and not r.labelled
+        if r.reviewed and not r.labelled and r not in observation_events
     ]
 
     return {
         "events": len(records),
         "labelled": len(labelled),
         "reviewedUnknown": len(unknown),
-        "unreviewed": sum(1 for r in records if not r.reviewed),
+        "unreviewed": sum(
+            1 for r in records
+            if not r.reviewed and r not in observation_events
+        ),
+        # v2 observation events carry per-observation reviews that this
+        # scoring does not read yet.
+        "observationEvents": len(observation_events),
         "steady": sum(
             1 for r in labelled if r.actual_from == r.actual_to
         ),
@@ -268,7 +318,7 @@ def truth_labels(
     warmup: float = DEFAULT_WARMUP_SECONDS,
     guard: float = DEFAULT_GUARD_SECONDS,
 ) -> np.ndarray:
-    """Per-window label code, or UNSCORED where there is none to trust."""
+    """Per-window historical label code, or UNSCORED where untrusted."""
     labels = np.full(times.shape, UNSCORED, dtype=np.int8)
 
     if not record.labelled:
@@ -289,6 +339,44 @@ def truth_labels(
     return labels
 
 
+def observation_truth(truth: np.ndarray) -> dict[str, np.ndarray]:
+    """Per-window yes/no truth for each observation, from the old labels.
+
+    COMPATIBILITY ASSUMPTION: the compressor runs only while the fan is
+    turning, so a COMPRESSOR label means both are on. See the module
+    docstring; this is a bridge for historical reviews, not a schema.
+
+    Returns int8 arrays: 1 = yes, 0 = no, UNSCORED where untrusted.
+    """
+    scored = truth != UNSCORED
+
+    fan = np.where(scored, (truth >= LABEL_CODE["FAN"]).astype(np.int8),
+                   UNSCORED).astype(np.int8)
+    compressor = np.where(
+        scored, (truth == LABEL_CODE["COMPRESSOR"]).astype(np.int8),
+        UNSCORED,
+    ).astype(np.int8)
+
+    return {"fan": fan, "compressor": compressor}
+
+
+def legacy_observations(codes: np.ndarray) -> dict[str, np.ndarray]:
+    """Fold v1's single state onto the two observations.
+
+    Same compatibility mapping as the truth, so v1 is scored on the
+    same terms: its COMPRESSOR claims the fan is running too. -1 (nothing
+    published yet) stays -1.
+    """
+    known = codes >= 0
+
+    return {
+        "fan": np.where(known, (codes >= 1).astype(np.int8), UNKNOWN)
+        .astype(np.int8),
+        "compressor": np.where(known, (codes == 2).astype(np.int8), UNKNOWN)
+        .astype(np.int8),
+    }
+
+
 # ---------------------------------------------------------------------
 # Windows of features, cached
 # ---------------------------------------------------------------------
@@ -303,10 +391,19 @@ class WindowSet:
     matrix: np.ndarray                 # (N, F)
     sample_rate: int
     hop: int
+    nfft: int = 1024
 
     @property
     def window_rate(self) -> float:
         return self.sample_rate / self.hop
+
+    @property
+    def hop_seconds(self) -> float:
+        return self.hop / self.sample_rate
+
+    @property
+    def window_seconds(self) -> float:
+        return self.nfft / self.sample_rate
 
     def column(self, name: str) -> np.ndarray:
         return self.matrix[:, self.names.index(name)]
@@ -362,11 +459,12 @@ def extract_windows(wav_path: Path) -> WindowSet:
         matrix=np.array(rows, dtype=np.float64),
         sample_rate=sample_rate,
         hop=extractor.hop,
+        nfft=extractor.nfft,
     )
 
 
 class FeatureCache:
-    """Disk cache of extractor output, one file per event.
+    """Disk cache of extractor output, one file per WAV.
 
     The extractor is by far the slow part of a replay (about 40 s for a
     few hundred events) and it has no tunable settings: what it produces
@@ -394,7 +492,8 @@ class FeatureCache:
             [CACHE_VERSION, self._dsp, stat.st_size, stat.st_mtime_ns]
         )
 
-    def get(self, record: EventRecord) -> WindowSet:
+    def get(self, record) -> WindowSet:
+        """Windows for anything with ``.id`` and ``.wav_path``."""
         if self.directory is None:
             self.misses += 1
             return extract_windows(record.wav_path)
@@ -414,6 +513,7 @@ class FeatureCache:
                             matrix=data["matrix"],
                             sample_rate=int(data["sample_rate"]),
                             hop=int(data["hop"]),
+                            nfft=int(data["nfft"]),
                         )
             except (OSError, ValueError, KeyError):
                 pass            # unreadable: just recompute it
@@ -429,6 +529,7 @@ class FeatureCache:
             matrix=windows.matrix,
             sample_rate=np.array(windows.sample_rate),
             hop=np.array(windows.hop),
+            nfft=np.array(windows.nfft),
         )
 
         return windows
@@ -440,8 +541,13 @@ class ScoredEvent:
 
     record: EventRecord
     windows: WindowSet
-    truth: np.ndarray
+    truth: np.ndarray                  # historical three-way label codes
     group: int
+    observed: dict[str, np.ndarray] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.observed:
+            self.observed = observation_truth(self.truth)
 
     @property
     def scored(self) -> int:
@@ -474,20 +580,39 @@ def prepare(
 
 
 # ---------------------------------------------------------------------
-# Exact replay: the real Smoother
+# Exact replay: the real smoothers
 # ---------------------------------------------------------------------
 
 
-def replay_exact(
+@dataclass
+class ObservationRun:
+    """One classifier's replay, as fan and compressor observations.
+
+    ``candidate`` is the detector's verdict on the smoothed features;
+    ``published`` is after the hold, which is what a consumer sees.
+    Each maps observation -> one int8 array per event: 1 yes, 0 no,
+    UNKNOWN (-1) before anything was published.
+    """
+
+    label: str
+    candidate: dict[str, list[np.ndarray]] = field(
+        default_factory=lambda: {o: [] for o in OBSERVATIONS}
+    )
+    published: dict[str, list[np.ndarray]] = field(
+        default_factory=lambda: {o: [] for o in OBSERVATIONS}
+    )
+
+
+def replay_v1(
     windows: WindowSet,
     rule,
     median_seconds: float,
     hold_seconds: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Candidate and published state per window, via the real Smoother.
+    """v1's candidate and published state codes, via the real Smoother.
 
-    Returns two int arrays of state codes. Published state is -1 until
-    the first candidate has held long enough to be published.
+    State codes are 0 OFF, 1 FAN, 2 COMPRESSOR; -1 means nothing has
+    been published yet.
     """
     smoother = Smoother(
         rule,
@@ -510,64 +635,187 @@ def replay_exact(
     return candidates, states
 
 
+def replay_v2(
+    windows: WindowSet,
+    rules: ObservationRules,
+    median_seconds: float,
+    hold_seconds: float,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """v2's candidate and published observations, via the real smoother."""
+    smoother = ObservationSmoother(
+        rules,
+        window_rate=windows.window_rate,
+        median_seconds=median_seconds,
+        hold_seconds=hold_seconds,
+    )
+
+    count = len(windows.times)
+    candidate = {o: np.empty(count, dtype=np.int8) for o in OBSERVATIONS}
+    published = {o: np.empty(count, dtype=np.int8) for o in OBSERVATIONS}
+
+    def code(value):
+        return UNKNOWN if value is None else int(value)
+
+    for index, window in enumerate(windows.features()):
+        decision = smoother.update(window)
+
+        candidate["fan"][index] = int(decision.fan_candidate)
+        candidate["compressor"][index] = int(decision.compressor_candidate)
+        published["fan"][index] = code(decision.fan_detected)
+        published["compressor"][index] = code(decision.compressor_detected)
+
+    return candidate, published
+
+
+def run_v1(
+    label: str,
+    events: list["ScoredEvent"],
+    rule,
+    median_seconds: float,
+    hold_seconds: float,
+) -> ObservationRun:
+    """Replay every event under v1 and fold it onto the observations."""
+    run = ObservationRun(label)
+
+    for event in events:
+        candidate, state = replay_v1(
+            event.windows, rule, median_seconds, hold_seconds
+        )
+
+        for observation, values in legacy_observations(candidate).items():
+            run.candidate[observation].append(values)
+
+        for observation, values in legacy_observations(state).items():
+            run.published[observation].append(values)
+
+    return run
+
+
+def run_v2(
+    label: str,
+    events: list["ScoredEvent"],
+    rules: ObservationRules,
+    median_seconds: float,
+    hold_seconds: float,
+) -> ObservationRun:
+    """Replay every event under v2's independent observations."""
+    run = ObservationRun(label)
+
+    for event in events:
+        candidate, published = replay_v2(
+            event.windows, rules, median_seconds, hold_seconds
+        )
+
+        for observation in OBSERVATIONS:
+            run.candidate[observation].append(candidate[observation])
+            run.published[observation].append(published[observation])
+
+    return run
+
+
+def replay_beeps(
+    windows: WindowSet, config: BeepConfig
+) -> tuple[list, BeepDetector]:
+    """Beep events in a recording, from the same raw windows live sees.
+
+    Returns the events and the detector, whose counters say what it
+    considered and turned down.
+    """
+    detector = BeepDetector(
+        config,
+        hop_seconds=windows.hop_seconds,
+        window_seconds=windows.window_seconds,
+    )
+    events: list = []
+
+    for window in windows.features():
+        events.extend(detector.update(window))
+
+    events.extend(detector.flush())
+
+    return events, detector
+
+
 # ---------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------
 
 
 def confusion(truth: np.ndarray, predicted: np.ndarray) -> np.ndarray:
-    """3x4 counts: truth (OFF, FAN, COMPRESSOR) x predicted + 'none'."""
+    """2x3 counts: truth (no, yes) x predicted (no, yes, nothing yet).
+
+    Only windows with a trustworthy label count.
+    """
     mask = truth != UNSCORED
 
     if not mask.any():
-        return np.zeros((3, 4), dtype=np.int64)
+        return np.zeros((2, 3), dtype=np.int64)
 
-    predicted = np.where(predicted < 0, NO_STATE, predicted)
-    flat = truth[mask].astype(np.int64) * 4 + predicted[mask]
+    predicted = np.where(predicted < 0, NONE_COLUMN, predicted)
+    flat = truth[mask].astype(np.int64) * 3 + predicted[mask]
 
-    return np.bincount(flat, minlength=12).reshape(3, 4)
+    return np.bincount(flat, minlength=6).reshape(2, 3)
 
 
 def metrics(matrix: np.ndarray) -> dict:
-    """Headline numbers from a 3x4 confusion matrix."""
+    """Headline numbers from a 2x3 confusion matrix.
+
+    ``truePositive`` and friends are windows. Nothing-published-yet
+    windows count as misses on whichever side they fall: not knowing is
+    not the same as knowing it is off.
+    """
     matrix = np.asarray(matrix, dtype=np.int64)
-    totals = matrix.sum(axis=1)
 
-    recall = np.array([
-        matrix[i, i] / totals[i] if totals[i] else np.nan
-        for i in range(3)
-    ])
+    absent, present = matrix[0], matrix[1]
 
-    predicted_totals = matrix[:, :3].sum(axis=0)
-    precision = np.array([
-        matrix[i, i] / predicted_totals[i] if predicted_totals[i] else np.nan
-        for i in range(3)
-    ])
+    true_negative, false_positive = int(absent[0]), int(absent[1])
+    false_negative, true_positive = int(present[0]), int(present[1])
 
-    present = ~np.isnan(recall)
+    absent_total = int(absent.sum())
+    present_total = int(present.sum())
+
+    recall = true_positive / present_total if present_total else None
+    specificity = true_negative / absent_total if absent_total else None
+    called = true_positive + false_positive
+    precision = true_positive / called if called else None
+
+    rates = [r for r in (recall, specificity) if r is not None]
 
     return {
         "windows": int(matrix.sum()),
+        "present": present_total,
+        "absent": absent_total,
+        "truePositive": true_positive,
+        "falsePositive": false_positive,
+        "falseNegative": false_negative,
+        "trueNegative": true_negative,
+        "unpublished": int(matrix[:, NONE_COLUMN].sum()),
+        # fraction of windows where it really was running and we said so
+        "recall": recall,
+        # ... and where it was not running and we said so
+        "specificity": specificity,
+        "precision": precision,
         "balancedAccuracy": (
-            float(np.nanmean(recall)) if present.any() else None
+            float(np.mean(rates)) if rates else None
         ),
-        "recall": {
-            LABELS[i]: _num(recall[i]) for i in range(3)
-        },
-        "precision": {
-            LABELS[i]: _num(precision[i]) for i in range(3)
-        },
-        "offToFan": int(matrix[0, 1]),
-        "offToCompressor": int(matrix[0, 2]),
-        "fanToOff": int(matrix[1, 0]),
-        "fanToCompressor": int(matrix[1, 2]),
-        "compressorMisses": int(matrix[2].sum() - matrix[2, 2]),
-        "unpublished": int(matrix[:, 3].sum()),
     }
 
 
-def _num(value: float) -> float | None:
-    return None if np.isnan(value) else float(value)
+def run_confusions(
+    events: list[ScoredEvent],
+    run: ObservationRun,
+    level: str = "published",
+) -> dict[str, np.ndarray]:
+    """Per-event confusion for each observation: (events, 2, 3)."""
+    source = run.published if level == "published" else run.candidate
+
+    return {
+        observation: np.stack([
+            confusion(event.observed[observation], predicted)
+            for event, predicted in zip(events, source[observation])
+        ])
+        for observation in OBSERVATIONS
+    }
 
 
 # ---------------------------------------------------------------------
@@ -578,8 +826,8 @@ def _num(value: float) -> float | None:
 def rolling_median(matrix: np.ndarray, width: int) -> np.ndarray:
     """Median over the last ``width`` rows, fewer at the start.
 
-    Matches the Smoother, which takes the median of however many
-    windows it has up to its span.
+    Matches the smoothers, which take the median of however many
+    windows they have up to their span.
     """
     rows = matrix.shape[0]
     out = np.empty_like(matrix)
@@ -600,10 +848,10 @@ def rolling_median(matrix: np.ndarray, width: int) -> np.ndarray:
 def hold_published(
     candidates: np.ndarray, window_rate: float, hold_seconds: float
 ) -> np.ndarray:
-    """Published state per window from a candidate sequence.
+    """Published value per window from a candidate sequence.
 
     A candidate is published once it has been unchanged for
-    ``hold_seconds``; until then the previous state stands. -1 means
+    ``hold_seconds``; until then the previous value stands. -1 means
     nothing has been published yet.
     """
     count = len(candidates)
@@ -629,11 +877,12 @@ def hold_published(
 
 
 class FastEvaluator:
-    """Score many v2 settings quickly. See the module docstring.
+    """Score many detector settings quickly. See the module docstring.
 
     The smoothed features are computed once, since the median does not
-    depend on any threshold; each setting then costs one vectorised call
-    of the real rule plus a cheap hold per event.
+    depend on any threshold. The two detectors are independent, so each
+    setting of one costs one vectorised call of that detector plus a
+    cheap hold per event, and nothing of the other.
     """
 
     def __init__(
@@ -669,43 +918,77 @@ class FastEvaluator:
             offset += len(matrix)
 
         self.matrix = np.concatenate(smoothed)
-        self.truth = [event.truth for event in events]
+        self.truth = {
+            observation: [e.observed[observation] for e in events]
+            for observation in OBSERVATIONS
+        }
+        self._view = {
+            name: self.matrix[:, i] for name, i in self._index.items()
+        }
 
     def column(self, name: str) -> np.ndarray:
-        return self.matrix[:, self._index[name]]
+        return self._view[name]
 
-    def codes(self, rule: ThresholdsV2) -> np.ndarray:
-        """Candidate code per window, for every window of every event."""
-        view = {name: self.column(name) for name in self.names}
+    # -- one detector at a time -----------------------------------------
 
-        return classify_v2_codes(view, rule).astype(np.int8)
+    def fan_candidates(self, config: FanConfig) -> np.ndarray:
+        return np.asarray(detect_fan(self._view, config)).astype(np.int8)
 
-    def published(self, rule: ThresholdsV2) -> list[np.ndarray]:
-        codes = self.codes(rule)
+    def compressor_candidates(self, config: CompressorConfig) -> np.ndarray:
+        return np.asarray(
+            detect_compressor(self._view, config)
+        ).astype(np.int8)
 
+    def _published(self, candidates: np.ndarray) -> list[np.ndarray]:
         return [
-            hold_published(codes[a:b], rate, self.hold_seconds)
+            hold_published(candidates[a:b], rate, self.hold_seconds)
             for (a, b), rate in zip(self.bounds, self.rates)
         ]
 
-    def confusion(self, rule: ThresholdsV2) -> np.ndarray:
-        """Per-event 3x4 confusion, shape (events, 3, 4)."""
-        published = self.published(rule)
-
+    def _confusion(
+        self, observation: str, candidates: np.ndarray
+    ) -> np.ndarray:
         return np.stack([
             confusion(truth, state)
-            for truth, state in zip(self.truth, published)
+            for truth, state in zip(
+                self.truth[observation], self._published(candidates)
+            )
         ])
+
+    def fan_confusion(self, config: FanConfig) -> np.ndarray:
+        """Per-event fan confusion, shape (events, 2, 3)."""
+        return self._confusion("fan", self.fan_candidates(config))
+
+    def compressor_confusion(self, config: CompressorConfig) -> np.ndarray:
+        return self._confusion(
+            "compressor", self.compressor_candidates(config)
+        )
+
+    # -- both, as v2 runs them -------------------------------------------
+
+    def candidates(self, rules: ObservationRules) -> dict[str, np.ndarray]:
+        return {
+            "fan": self.fan_candidates(rules.fan),
+            "compressor": self.compressor_candidates(rules.compressor),
+        }
+
+    def published(
+        self, rules: ObservationRules
+    ) -> dict[str, list[np.ndarray]]:
+        return {
+            observation: self._published(codes)
+            for observation, codes in self.candidates(rules).items()
+        }
 
 
 def verify_fast_path(
     events: list[ScoredEvent],
-    rule: ThresholdsV2,
+    rules: ObservationRules,
     median_seconds: float,
     hold_seconds: float,
     limit: int | None = None,
 ) -> int:
-    """Check FastEvaluator against the real Smoother, window for window.
+    """Check FastEvaluator against the real smoother, window for window.
 
     Raises AssertionError on the first disagreement. Returns the number
     of events compared.
@@ -713,96 +996,60 @@ def verify_fast_path(
     chosen = events if limit is None else events[:limit]
 
     fast = FastEvaluator(chosen, median_seconds, hold_seconds)
-    codes = fast.codes(rule)
-    published = fast.published(rule)
+    candidates = fast.candidates(rules)
+    published = fast.published(rules)
 
-    for event, (a, b), state in zip(chosen, fast.bounds, published):
-        candidate_exact, state_exact = replay_exact(
-            event.windows, rule, median_seconds, hold_seconds
+    for index, (event, (a, b)) in enumerate(zip(chosen, fast.bounds)):
+        exact_candidate, exact_published = replay_v2(
+            event.windows, rules, median_seconds, hold_seconds
         )
 
-        assert np.array_equal(codes[a:b], candidate_exact), (
-            event.record.id, "candidate",
-        )
-        assert np.array_equal(state, state_exact), (
-            event.record.id, "published state",
-        )
+        for observation in OBSERVATIONS:
+            assert np.array_equal(
+                candidates[observation][a:b], exact_candidate[observation]
+            ), (event.record.id, observation, "candidate")
+            assert np.array_equal(
+                published[observation][index], exact_published[observation]
+            ), (event.record.id, observation, "published")
 
     return len(chosen)
-
-
-# ---------------------------------------------------------------------
-# Convenience
-# ---------------------------------------------------------------------
-
-
-@dataclass
-class Evaluation:
-    """A classifier's replay over a prepared dataset."""
-
-    label: str
-    rule: object
-    median_seconds: float
-    hold_seconds: float
-    candidate: list[np.ndarray] = field(default_factory=list)
-    published: list[np.ndarray] = field(default_factory=list)
-
-    def matrices(self, events: list[ScoredEvent], level: str = "published"):
-        source = self.published if level == "published" else self.candidate
-
-        return np.stack([
-            confusion(event.truth, predicted)
-            for event, predicted in zip(events, source)
-        ])
-
-
-def evaluate(
-    label: str,
-    events: list[ScoredEvent],
-    rule,
-    median_seconds: float,
-    hold_seconds: float,
-) -> Evaluation:
-    """Exact replay of every event under one rule."""
-    result = Evaluation(label, rule, median_seconds, hold_seconds)
-
-    for event in events:
-        candidate, state = replay_exact(
-            event.windows, rule, median_seconds, hold_seconds
-        )
-
-        result.candidate.append(candidate)
-        result.published.append(state)
-
-    return result
 
 
 __all__ = [
     "DEFAULT_GROUP_GAP_SECONDS",
     "DEFAULT_GUARD_SECONDS",
     "DEFAULT_WARMUP_SECONDS",
-    "LABELS",
-    "STATES",
-    "TEMPORAL_FILL",
     "FEATURE_NAMES",
-    "Evaluation",
+    "LABELS",
+    "LABEL_CODE",
+    "OBSERVATIONS",
+    "TEMPORAL_FILL",
+    "UNKNOWN",
+    "UNSCORED",
     "EventRecord",
     "FastEvaluator",
     "FeatureCache",
+    "ObservationRun",
     "ScoredEvent",
     "WindowSet",
     "confusion",
     "dataset_counts",
-    "evaluate",
     "extract_windows",
     "group_events",
     "hold_published",
+    "legacy_observations",
     "load_events",
     "metrics",
+    "observation_truth",
     "parse_event",
     "prepare",
-    "replay_exact",
+    "replay_beeps",
+    "replay_v1",
+    "replay_v2",
     "rolling_median",
+    "run_confusions",
+    "run_v1",
+    "run_v2",
     "truth_labels",
     "verify_fast_path",
 ]

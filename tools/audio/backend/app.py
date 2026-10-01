@@ -24,10 +24,12 @@ if __package__ in (None, ""):
     from backend.events import event_timeline
     from backend.history import to_epoch
     from backend.models import (
+        CommandContext,
+        CommandMarker,
         ConfigPatch,
         EventBulkReviewRequest,
         EventDeleteRequest,
-        ReviewPatch,
+        review_for_event,
     )
     from backend.stream import StreamService
 else:
@@ -36,16 +38,19 @@ else:
     from .events import event_timeline
     from .history import to_epoch
     from .models import (
+        CommandContext,
+        CommandMarker,
         ConfigPatch,
         EventBulkReviewRequest,
         EventDeleteRequest,
-        ReviewPatch,
+        review_for_event,
     )
     from .stream import StreamService
 
 import uvicorn
 from classifier import VERSIONS
 from fastapi import (
+    Body,
     FastAPI,
     HTTPException,
     Query,
@@ -55,6 +60,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import ValidationError
 from fastapi.staticfiles import StaticFiles
 
 AppConfig = config_module.AppConfig
@@ -112,6 +118,51 @@ def _require_version_fields(version: str, changes: dict) -> None:
             f"{', '.join(foreign)} only apply to classifier v2, "
             f"but this run is {version}"
         )
+
+
+def _bulk_review_fields(metadata: dict, request) -> dict:
+    """One review decision, expressed in the shape this event takes.
+
+    The same click means different things for the two schemas: on a v1
+    event it settles the combined state before and after, on a v2 event
+    it settles one observation. Either way a "correct" verdict means the
+    classifier's own claim stands.
+    """
+    verdict = request.verdict
+
+    if metadata.get("classifierVersion") == "v2" and metadata.get(
+        "eventType"
+    ):
+        body = {
+            "correct": verdict,
+            "interference": request.interference,
+            "notes": request.notes,
+        }
+        event_type = metadata["eventType"]
+
+        if event_type in ("fan", "compressor") and request.actualValue \
+                is not None:
+            body["actualValue"] = request.actualValue
+
+        if event_type == "beep" and request.actualBeep is not None:
+            body["actualBeep"] = request.actualBeep
+
+        return review_for_event(metadata, body)
+
+    if verdict:
+        actual_from = metadata.get("from") or "UNKNOWN"
+        actual_to = metadata.get("to") or "UNKNOWN"
+    else:
+        actual_from = request.actualFrom
+        actual_to = request.actualTo
+
+    return review_for_event(metadata, {
+        "classificationCorrect": verdict,
+        "actualFrom": actual_from,
+        "actualTo": actual_to,
+        "interference": request.interference,
+        "notes": request.notes,
+    })
 
 
 def create_app(settings: AppConfig) -> FastAPI:
@@ -262,20 +313,18 @@ def create_app(settings: AppConfig) -> FastAPI:
                     detail={"message": "event selection is stale", "ids": [identifier]},
                 )
 
-            if request.classificationCorrect:
-                actual_from = metadata.get("from") or "UNKNOWN"
-                actual_to = metadata.get("to") or "UNKNOWN"
-            else:
-                actual_from = request.actualFrom
-                actual_to = request.actualTo
-
-            reviews[identifier] = {
-                "classificationCorrect": request.classificationCorrect,
-                "actualFrom": actual_from,
-                "actualTo": actual_to,
-                "interference": request.interference,
-                "notes": request.notes,
-            }
+            try:
+                reviews[identifier] = _bulk_review_fields(
+                    metadata, request
+                )
+            except (ValueError, ValidationError) as error:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "message": f"cannot review {identifier}: {error}",
+                        "ids": [identifier],
+                    },
+                ) from error
 
         updated, missing = service.events.review_many(reviews)
         if missing:
@@ -316,16 +365,80 @@ def create_app(settings: AppConfig) -> FastAPI:
 
     @app.patch("/api/events/{identifier}/review")
     async def patch_event_review(
-        identifier: str, patch: ReviewPatch
+        identifier: str, body: dict = Body(...)
     ) -> dict:
+        """Save a human review. Its shape depends on the event.
+
+        v1 events take ``classificationCorrect`` with ``actualFrom`` and
+        ``actualTo``; v2 observation events take ``correct`` and what is
+        right for their type. The body is validated against the event it
+        is for, so a review cannot say something the event cannot mean.
+        """
+        existing = (
+            service.events.get(identifier)
+            if service.events is not None else None
+        )
+        if existing is None:
+            raise HTTPException(status_code=404, detail="no such event")
+
+        try:
+            fields = review_for_event(existing, body)
+        except (ValueError, ValidationError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+        metadata = service.events.review(identifier, fields)
+        if metadata is None:
+            raise HTTPException(status_code=404, detail="no such event")
+        return metadata
+
+    @app.patch("/api/events/{identifier}/command-context")
+    async def patch_command_context(
+        identifier: str, context: CommandContext
+    ) -> dict:
+        """Record by hand that a command was sent near this event."""
         metadata = (
-            service.events.review(identifier, patch.model_dump())
-            if service.events is not None
-            else None
+            service.events.annotate(
+                identifier, {"commandContext": context.model_dump()}
+            )
+            if service.events is not None else None
         )
         if metadata is None:
             raise HTTPException(status_code=404, detail="no such event")
         return metadata
+
+    @app.delete("/api/events/{identifier}/command-context")
+    async def delete_command_context(identifier: str) -> dict:
+        metadata = (
+            service.events.annotate(identifier, {"commandContext": None})
+            if service.events is not None else None
+        )
+        if metadata is None:
+            raise HTTPException(status_code=404, detail="no such event")
+        return metadata
+
+    # --------------------------------------------------- commands
+
+    @app.post("/api/commands", status_code=201)
+    async def post_command(marker: CommandMarker) -> dict:
+        """Note that a command was just sent to the air conditioner.
+
+        A record for later analysis (how often a command is followed by
+        a beep, and how soon). Watson attaches it to nearby events but
+        never acts on it; interpreting it is the controller's job.
+        """
+        return service.record_command(
+            marker.command, marker.expectedBeep, marker.note
+        )
+
+    @app.get("/api/commands")
+    async def get_commands(
+        seconds: float = Query(default=3600.0, gt=0.0, le=2_592_000.0),
+    ) -> dict:
+        now = time.time()
+
+        return {
+            "commands": service.history.commands_between(now - seconds, now)
+        }
 
     @app.delete(
         "/api/events/{identifier}",

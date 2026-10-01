@@ -1,7 +1,7 @@
 """Classifier versions.
 
-    v1   threshold classifier: 30-80 Hz -> COMPRESSOR, else fan bands
-    v2   v1 plus a stationarity gate on FAN
+    v1   one state, OFF / FAN / COMPRESSOR, by thresholds
+    v2   independent observations: fan, compressor, beep
 
 Everything version-independent -- the states, the smoother and the
 publication hold -- lives in ``common``. A version is a *rule*: an
@@ -18,6 +18,9 @@ from .common import (
     OFF,
     STATES,
     Decision,
+    HoldTimer,
+    ObservationDecision,
+    ObservationSmoother,
     Rule,
     Smoother,
 )
@@ -33,6 +36,9 @@ __all__ = [
     "STATES",
     "VERSIONS",
     "Decision",
+    "HoldTimer",
+    "ObservationDecision",
+    "ObservationSmoother",
     "Rule",
     "Smoother",
 ]

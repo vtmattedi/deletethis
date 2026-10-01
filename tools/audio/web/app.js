@@ -37,6 +37,18 @@ const SETTINGS = [
   ["eventPostSeconds", "event post s", "number", 1],
 ];
 
+// Classifier v2 only. The backend rejects these on a v1 run, so they
+// are shown only when it says it is running v2.
+const V2_SETTINGS = [
+  ["fanStabilityThreshold", "fan stability limit dB", "number", 0.25],
+  ["fanStabilityFeature", "stability feature", "select", [
+    "1k-2k_std", "500-1k_std", "2k-4k_std", "rms_std",
+    "spectral_flux_median", "spectral_flux_std",
+  ]],
+  ["fanStabilityMinSeconds", "stability history s", "number", 0.25],
+];
+let activeSettings = SETTINGS;
+
 const $ = (id) => document.getElementById(id);
 const DEFAULT_PLAYBACK_GAIN_DB = 6;
 
@@ -295,7 +307,11 @@ function buildSettings(config) {
   if (form.dataset.built) return;
   form.dataset.built = "1";
 
-  for (const [key, label, kind, arg] of SETTINGS) {
+  activeSettings = config.classifierVersion === "v2"
+    ? [...SETTINGS, ...V2_SETTINGS]
+    : SETTINGS;
+
+  for (const [key, label, kind, arg] of activeSettings) {
     const wrap = document.createElement("label");
     const text = document.createElement("span");
     text.textContent = label;
@@ -330,7 +346,7 @@ function buildSettings(config) {
 
 async function saveSettings() {
   const changes = {};
-  for (const [key, , kind] of SETTINGS) {
+  for (const [key, , kind] of activeSettings) {
     const input = $("cfg-" + key);
     if (!input.value) {
       $("saved").textContent = "Fill in every setting before saving";
@@ -353,7 +369,7 @@ async function saveSettings() {
   }
 
   const config = await response.json();
-  for (const [name] of SETTINGS) {
+  for (const [name] of activeSettings) {
     const field = $("cfg-" + name);
     if (field) field.value = config[name];
   }
@@ -367,7 +383,7 @@ function applyConfig(config) {
   buildSettings(config);
 
   if (!settingsDirty) {
-    for (const [name] of SETTINGS) {
+    for (const [name] of activeSettings) {
       const field = $("cfg-" + name);
       if (field) field.value = config[name];
     }
@@ -375,6 +391,31 @@ function applyConfig(config) {
 }
 
 $("saveSettings").addEventListener("click", saveSettings);
+
+function renderClassifier(data) {
+  const config = data.config || {};
+  const version = data.classifierVersion || config.classifierVersion;
+  const v2 = version === "v2";
+
+  $("classifierVersion").textContent = version ? version.toUpperCase() : "--";
+
+  for (const id of ["dtStability", "ddStability", "dtThreshold", "ddThreshold"]) {
+    $(id).hidden = !v2;
+  }
+  if (!v2) return;
+
+  const feature = config.fanStabilityFeature || "1k-2k_std";
+  const value = (data.features || {})[feature];
+  const limit = config.fanStabilityThreshold;
+
+  $("ddStability").textContent = value == null
+    ? "--"
+    : `${formatFeatureValue(feature, value)} (${feature})`;
+  $("ddThreshold").textContent = limit == null ? "--" : `${limit} dB`;
+  // Steady means at or under the limit: that is what lets FAN through.
+  $("ddStability").className =
+    value == null || limit == null ? "" : value <= limit ? "steady" : "moving";
+}
 
 function render(data) {
   const state = data.state || "--";
@@ -387,6 +428,7 @@ function render(data) {
     data.stableSeconds == null ? "--" : data.stableSeconds.toFixed(1) + " s";
 
   renderFeatures(data.features || {});
+  renderClassifier(data);
 
   const stream = data.stream || {};
   rows($("stream"), STREAM_FIELDS.map(([key, label]) => [
@@ -1089,10 +1131,22 @@ async function openEvent(id, item) {
     ["source", meta.source || "transition"],
     ["time", meta.time.replace("T", " ")],
     ["classifier", `${meta.from || "--"} → ${meta.to}`],
+    // Events recorded before versions existed carry no version: v1.
+    ["classifier version", (meta.classifierVersion || "v1").toUpperCase() +
+      (meta.classifierVersion ? "" : " (recorded before versions)")],
     ["candidate held", meta.candidateHeldSeconds + " s"],
     ["audio", `${meta.audio.seconds} s ` +
       `(${meta.audio.preSeconds} before / ${meta.audio.postSeconds} after)`],
   ]));
+  const recorded = meta.featuresAtTransition || {};
+  left.append(heading("stationarity at transition"), table(
+    ["1k-2k_std", "500-1k_std", "2k-4k_std"].map((name) => [
+      name,
+      recorded[name] == null
+        ? "not recorded"
+        : formatFeatureValue(name, recorded[name]),
+    ]),
+  ));
   left.append(heading("features at transition"), table(
     Object.entries(meta.featuresAtTransition).map(
       ([k, v]) => [k, formatFeatureValue(k, v)]),

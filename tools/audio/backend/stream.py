@@ -20,7 +20,7 @@ from typing import Callable
 
 from acstream import AudioStream, ProtocolError
 
-from .classifier import ClassifierService
+from .classifier import make_classifier_service
 from .config import AppConfig
 from .events import EventRecorder
 from .history import HistoryStore
@@ -99,6 +99,16 @@ class StreamService(threading.Thread):
         # Last published state, for naming transitions.
         self._previous_state: str | None = None
 
+        # v2: the same, for each observation on its own. None means "not
+        # known yet", and the first value published is a baseline, not
+        # a change.
+        self._previous_observation: dict[str, bool | None] = {
+            "fan": None, "compressor": None,
+        }
+
+        # Events carry the commands the operator said they sent nearby.
+        self.events.command_lookup = self.history.commands_between
+
     # ------------------------------------------------------- loop
 
     def run(self) -> None:
@@ -176,11 +186,119 @@ class StreamService(threading.Thread):
                 f"({metadata['audio']['seconds']:.1f}s)"
             )
 
+        if self.config.classifier.version == "v2":
+            for step in produced:
+                self._on_observations(step)
+
+            return
+
         for _features, decision in produced:
             if not decision.changed:
                 continue
 
             self._on_transition(decision)
+
+    # ------------------------------------------- v2: observations
+
+    @staticmethod
+    def _published(decision) -> dict:
+        """The two observations as they stand (None = not known yet)."""
+        return {
+            "fan": decision.fan_detected,
+            "compressor": decision.compressor_detected,
+        }
+
+    def _on_observations(self, step) -> None:
+        decision = step.decision
+
+        if decision.fan_changed:
+            self._on_observation(
+                "fan", decision.fan_detected,
+                decision.fan_stable_seconds, step,
+            )
+
+        if decision.compressor_changed:
+            self._on_observation(
+                "compressor", decision.compressor_detected,
+                decision.compressor_stable_seconds, step,
+            )
+
+        for beep in step.beeps:
+            self._on_beep(beep, decision)
+
+    def _on_observation(
+        self, name: str, value: bool, stable: float, step
+    ) -> None:
+        """One observation changed. Record it, unless it is a baseline.
+
+        Fan and compressor are tracked separately: a change in one is
+        neither suppressed nor renamed by the other.
+        """
+        assert self.classifier is not None
+
+        previous = self._previous_observation[name]
+
+        # The first value after a start or a gap is the classifier
+        # finding out, not something changing. See _break_continuity.
+        if previous is None:
+            self._previous_observation[name] = value
+
+            print(f"{name}: settled on {'on' if value else 'off'}")
+
+            return
+
+        if previous == value:
+            return
+
+        snapshot = self.classifier.current()
+
+        identifier = self.events.start(
+            from_state=previous,
+            to_state=value,
+            stable_seconds=stable,
+            stream_time=snapshot.stream_time,
+            features=snapshot.features,
+            decision_window=self.classifier.decision_window(),
+            classifier_config=self.classifier.config,
+            event_type=name,
+            identifier_suffix=f"{name.upper()}_{'ON' if value else 'OFF'}",
+            extra={"observations": self._published(step.decision)},
+        )
+
+        print(
+            f"{name}: {'on' if previous else 'off'} -> "
+            f"{'on' if value else 'off'}  (held {stable:.1f}s)  "
+            f"event {identifier}"
+        )
+
+        self._previous_observation[name] = value
+
+    def _on_beep(self, beep, decision) -> None:
+        """A beep is an event in its own right, not a state."""
+        assert self.classifier is not None
+
+        snapshot = self.classifier.current()
+
+        identifier = self.events.start(
+            from_state=None,
+            to_state=None,
+            stable_seconds=0.0,
+            stream_time=beep.start_time,
+            features=snapshot.features,
+            decision_window=self.classifier.decision_window(),
+            classifier_config=self.classifier.config,
+            event_type="beep",
+            identifier_suffix="BEEP",
+            extra={
+                "beep": beep.to_api(),
+                "observations": self._published(decision),
+            },
+        )
+
+        print(
+            f"beep: {beep.duration_ms:.0f} ms at {beep.peak_hz:.0f} Hz, "
+            f"{beep.contrast_db:.1f} dB contrast  event {identifier}"
+        )
 
     def add_audio_listener(self, listener: Callable[[bytes], None]) -> None:
         with self.lock:
@@ -260,6 +378,32 @@ class StreamService(threading.Thread):
             return None
 
         snapshot = self.classifier.current()
+
+        if self.config.classifier.version == "v2":
+            if snapshot.stream_time <= 0.0:
+                return None
+
+            identifier = self.events.start(
+                from_state=None,
+                to_state=None,
+                stable_seconds=0.0,
+                stream_time=snapshot.stream_time,
+                features=snapshot.features,
+                decision_window=self.classifier.decision_window(),
+                classifier_config=self.classifier.config,
+                source="manual",
+                event_type="manual",
+                identifier_suffix="MANUAL",
+                extra={
+                    "observations": {
+                        "fan": snapshot.fan_detected,
+                        "compressor": snapshot.compressor_detected,
+                    },
+                },
+            )
+            print(f"event: manual capture {identifier}")
+            return identifier
+
         if snapshot.state is None:
             return None
 
@@ -288,7 +432,7 @@ class StreamService(threading.Thread):
             self.health.connected_since = time.monotonic()
 
         if self.classifier is None:
-            self.classifier = ClassifierService(
+            self.classifier = make_classifier_service(
                 info.sample_rate,
                 self.config.classifier,
             )
@@ -363,6 +507,7 @@ class StreamService(threading.Thread):
         genuine continuous transitions are recorded normally.
         """
         self._previous_state = None
+        self._previous_observation = {"fan": None, "compressor": None}
 
     def _update_counters(self, stream) -> None:
         with self.lock:
@@ -380,6 +525,33 @@ class StreamService(threading.Thread):
             self.history.record_connection(False, message)
 
         print(f"stream: {message}; retrying")
+
+    # --------------------------------------------------- commands
+
+    def record_command(
+        self, command: str, expected_beep: bool, note: str = ""
+    ) -> dict:
+        """Note that the operator just sent a command.
+
+        Only a record. Watson does not interpret it, and the beep
+        detector does not look at it: the point is to let later analysis
+        ask how often a command was followed by a beep, and how soon.
+        """
+        stream_seconds = (
+            self.classifier.current().stream_time
+            if self.classifier is not None else 0.0
+        )
+
+        marker = self.history.record_command(
+            command, expected_beep, stream_seconds, note
+        )
+
+        print(
+            f"command: {command}"
+            f"{' (beep expected)' if expected_beep else ''}"
+        )
+
+        return marker
 
     # ------------------------------------------------------- API
 

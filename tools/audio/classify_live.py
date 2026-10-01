@@ -8,6 +8,11 @@
         --fan-high-threshold -68 \
         --hold-seconds 2
 
+This is the **v1** tool: one state, OFF / FAN / COMPRESSOR. Classifier
+v2 reports independent observations (fan, compressor, beep) and is run by
+the backend (``backend/app.py``) and scored by ``evaluate_events.py``;
+there is no single state to print for it, so it is not offered here.
+
 Reads the same 16 kHz mono PCM stream as capture.py, over the same
 protocol, with no firmware changes: the ESP32 still just streams audio
 and every decision is made here, where a threshold can be changed
@@ -87,7 +92,6 @@ from classifier import (  # noqa: E402
     DEFAULT_MEDIAN_SECONDS,
     FAN,
     OFF,
-    VERSIONS,
     Decision,
     Smoother,
 )
@@ -100,52 +104,11 @@ from classifier.v1 import (  # noqa: E402
     classify,
 )
 
-from classifier import v2 as rules_v2  # noqa: E402
-from classifier.v2 import STABILITY_FEATURES, ThresholdsV2  # noqa: E402
-
 DEFAULT_REFRESH_HZ = 5.0
-
-# Threshold defaults per classifier version. The two differ on
-# purpose: v2 carries the compressor threshold the live system
-# actually runs at (see classifier/v2.py).
-VERSION_DEFAULTS = {
-    "v1": {
-        "compressor_threshold": DEFAULT_COMPRESSOR_THRESHOLD,
-        "fan_mid_threshold": DEFAULT_FAN_MID_THRESHOLD,
-        "fan_high_threshold": DEFAULT_FAN_HIGH_THRESHOLD,
-        "fan_require": DEFAULT_FAN_REQUIRE,
-    },
-    "v2": {
-        "compressor_threshold": rules_v2.DEFAULT_COMPRESSOR_THRESHOLD,
-        "fan_mid_threshold": rules_v2.DEFAULT_FAN_MID_THRESHOLD,
-        "fan_high_threshold": rules_v2.DEFAULT_FAN_HIGH_THRESHOLD,
-        "fan_require": rules_v2.DEFAULT_FAN_REQUIRE,
-    },
-}
-
-
-def resolve_defaults(args):
-    """Fill threshold flags the user left out with the version's own."""
-    for name, value in VERSION_DEFAULTS[args.classifier].items():
-        if getattr(args, name) is None:
-            setattr(args, name, value)
-
-    return args
 
 
 def build_rule(args):
-    """The decision rule for the chosen classifier version."""
-    if args.classifier == "v2":
-        return ThresholdsV2(
-            compressor=args.compressor_threshold,
-            fan_mid=args.fan_mid_threshold,
-            fan_high=args.fan_high_threshold,
-            fan_require_both=args.fan_require == "both",
-            stability_feature=args.fan_stability_feature,
-            stability_threshold=args.fan_stability_threshold,
-            stability_min_seconds=args.fan_stability_min_seconds,
-        )
-
+    """The v1 decision rule for the thresholds given."""
     return Thresholds(
         compressor=args.compressor_threshold,
         fan_mid=args.fan_mid_threshold,
@@ -156,21 +119,12 @@ def build_rule(args):
 
 def describe_rule(args):
     """Human-readable lines for the rule in force."""
-    lines = [
+    return [
         f"COMPRESSOR if 30-80 >= {args.compressor_threshold:g} dB",
         f"FAN if 500-1k >= {args.fan_mid_threshold:g} "
         f"{'and' if args.fan_require == 'both' else 'or'} "
         f"1k-2k >= {args.fan_high_threshold:g} dB",
     ]
-
-    if args.classifier == "v2":
-        lines.append(
-            f"    and {args.fan_stability_feature} <= "
-            f"{args.fan_stability_threshold:g} dB "
-            f"(needs {args.fan_stability_min_seconds:g}s of history)"
-        )
-
-    return lines
 
 
 # ---------------------------------------------------------------------
@@ -545,7 +499,7 @@ def run_replay(args: argparse.Namespace) -> int:
         f"Replaying the live classifier over {len(results)} recording(s)"
     )
     print()
-    print(f"Classifier: {args.classifier}")
+    print("Classifier: v1")
     first, *rest = describe_rule(args)
     print(f"Rules:  {first}")
     for line in rest:
@@ -673,100 +627,48 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Window overlap (default: {DEFAULT_OVERLAP})",
     )
 
-    parser.add_argument(
-        "--classifier",
-        choices=VERSIONS,
-        default="v1",
-        help=(
-            "Classifier version: v1 thresholds, or v2 with a "
-            "stationarity gate on FAN (default: v1, the behaviour "
-            "this tool always had)"
-        ),
-    )
-
-    thresholds = parser.add_argument_group(
-        "thresholds (dBFS); defaults depend on --classifier"
-    )
+    thresholds = parser.add_argument_group("thresholds (dBFS)")
 
     thresholds.add_argument(
         "--compressor-threshold",
         type=float,
-        default=None,
+        default=DEFAULT_COMPRESSOR_THRESHOLD,
         help=(
             "30-80 Hz level at or above which the state is COMPRESSOR "
-            f"(v1: {DEFAULT_COMPRESSOR_THRESHOLD:g}, "
-            f"v2: {rules_v2.DEFAULT_COMPRESSOR_THRESHOLD:g})"
+            f"(default: {DEFAULT_COMPRESSOR_THRESHOLD:g})"
         ),
     )
 
     thresholds.add_argument(
         "--fan-mid-threshold",
         type=float,
-        default=None,
+        default=DEFAULT_FAN_MID_THRESHOLD,
         help=(
             "500-1k Hz level counting towards FAN "
-            f"(v1: {DEFAULT_FAN_MID_THRESHOLD:g}, "
-            f"v2: {rules_v2.DEFAULT_FAN_MID_THRESHOLD:g})"
+            f"(default: {DEFAULT_FAN_MID_THRESHOLD:g})"
         ),
     )
 
     thresholds.add_argument(
         "--fan-high-threshold",
         type=float,
-        default=None,
+        default=DEFAULT_FAN_HIGH_THRESHOLD,
         help=(
             "1k-2k Hz level counting towards FAN "
-            f"(v1: {DEFAULT_FAN_HIGH_THRESHOLD:g}, "
-            f"v2: {rules_v2.DEFAULT_FAN_HIGH_THRESHOLD:g})"
+            f"(default: {DEFAULT_FAN_HIGH_THRESHOLD:g})"
         ),
     )
 
     thresholds.add_argument(
         "--fan-require",
         choices=["either", "both"],
-        default=None,
+        default=DEFAULT_FAN_REQUIRE,
         help=(
             "Whether one or both fan bands must be over threshold "
             # argparse runs help text through %-expansion, so a literal
             # per cent sign has to be doubled.
             f"(default: {DEFAULT_FAN_REQUIRE}; 'either' cannot get "
             "past 93%% on the recorded data)"
-        ),
-    )
-
-    stability = parser.add_argument_group(
-        "fan stationarity gate (--classifier v2 only)"
-    )
-
-    stability.add_argument(
-        "--fan-stability-feature",
-        choices=STABILITY_FEATURES,
-        default=rules_v2.DEFAULT_FAN_STABILITY_FEATURE,
-        help=(
-            "Temporal feature that must stay small for FAN "
-            f"(default: {rules_v2.DEFAULT_FAN_STABILITY_FEATURE})"
-        ),
-    )
-
-    stability.add_argument(
-        "--fan-stability-threshold",
-        type=float,
-        default=rules_v2.DEFAULT_FAN_STABILITY_THRESHOLD,
-        help=(
-            "Largest value of that feature still read as a steady "
-            f"fan, in dB (default: "
-            f"{rules_v2.DEFAULT_FAN_STABILITY_THRESHOLD:g})"
-        ),
-    )
-
-    stability.add_argument(
-        "--fan-stability-min-seconds",
-        type=float,
-        default=rules_v2.DEFAULT_FAN_STABILITY_MIN_SECONDS,
-        help=(
-            "History the feature needs before the gate trusts it "
-            f"(default: "
-            f"{rules_v2.DEFAULT_FAN_STABILITY_MIN_SECONDS:g})"
         ),
     )
 
@@ -837,7 +739,7 @@ def print_settings(args: argparse.Namespace, window_rate: float) -> None:
         f"{args.overlap:.0%} overlap, Hamming, "
         f"{window_rate:.1f}/s"
     )
-    print(f"Classifier: {args.classifier}")
+    print("Classifier: v1")
     first, *rest = describe_rule(args)
     print(f"Rules:   {first}")
     for line in rest:
@@ -1012,7 +914,7 @@ def run(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = resolve_defaults(parser.parse_args(argv))
+    args = parser.parse_args(argv)
 
     if args.list_ports:
         ports = list_ports()
