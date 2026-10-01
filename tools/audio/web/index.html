@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>INMP441 Live</title>
-<link rel="stylesheet" href="style.css?v=20261001-3">
+<link rel="stylesheet" href="style.css?v=20261001-5">
 </head>
 <body>
 <header>
@@ -13,17 +13,76 @@
 </header>
 
 <main>
-  <section class="card state">
+  <!-- v1: one combined state. -->
+  <section class="card state" id="stateCard">
     <div id="state" class="state-name">--</div>
     <dl>
       <dt>candidate</dt><dd id="candidate">--</dd>
       <dt>stable</dt><dd id="stable">--</dd>
       <dt>classifier</dt><dd id="classifierVersion">--</dd>
-      <dt id="dtStability" hidden>fan stability</dt>
-      <dd id="ddStability" hidden>--</dd>
-      <dt id="dtThreshold" hidden>stability limit</dt>
-      <dd id="ddThreshold" hidden>--</dd>
     </dl>
+  </section>
+
+  <!-- v2: three separate observations. Nothing here adds them up. -->
+  <section class="card observation" id="fanCard" hidden>
+    <h2>Fan</h2>
+    <div id="fanValue" class="obs-value">--</div>
+    <dl>
+      <dt>candidate</dt><dd id="fanCandidate">--</dd>
+      <dt>held</dt><dd id="fanStable">--</dd>
+      <dt>energy</dt><dd id="fanEnergy">--</dd>
+      <dt>stability</dt><dd id="fanStability">--</dd>
+    </dl>
+  </section>
+
+  <section class="card observation" id="compressorCard" hidden>
+    <h2>Compressor</h2>
+    <div id="compressorValue" class="obs-value">--</div>
+    <dl>
+      <dt>candidate</dt><dd id="compressorCandidate">--</dd>
+      <dt>held</dt><dd id="compressorStable">--</dd>
+      <dt>30-80 Hz</dt><dd id="compressorLevel">--</dd>
+    </dl>
+  </section>
+
+  <section class="card observation" id="beepCard" hidden>
+    <h2>Beep</h2>
+    <div id="beepValue" class="obs-value">--</div>
+    <dl>
+      <dt>count</dt><dd id="beepCount">--</dd>
+      <dt>duration</dt><dd id="beepDuration">--</dd>
+      <dt>pitch</dt><dd id="beepPitch">--</dd>
+      <dt>contrast</dt><dd id="beepContrast">--</dd>
+    </dl>
+  </section>
+
+  <section class="card wide" id="v2Note" hidden>
+    <p class="note">
+      Classifier <strong>V2</strong>. Watson reports what it hears: is the
+      fan running, is the compressor running, did the unit just beep. It
+      does not say whether the air conditioner is on or whether a command
+      worked; that is for the controller, which knows what it sent.
+    </p>
+  </section>
+
+  <section class="card" id="commandCard" hidden>
+    <h2>Command marker</h2>
+    <form id="commandForm" onsubmit="return false">
+      <label><span>command</span>
+        <input id="commandName" list="commandNames" placeholder="POWER" autocomplete="off">
+        <datalist id="commandNames">
+          <option value="POWER"><option value="TEMP_UP"><option value="TEMP_DOWN">
+          <option value="MODE"><option value="FAN_SPEED"><option value="SWING">
+        </datalist>
+      </label>
+      <label class="inline"><input id="commandExpectBeep" type="checkbox" checked>
+        <span>a beep is expected</span></label>
+    </form>
+    <button id="markCommand" type="button">Mark command sent</button>
+    <p id="commandNote" class="note">
+      Only a record: events within 10 s carry it as context. It never
+      changes what is detected.
+    </p>
   </section>
 
   <section class="card">
@@ -83,8 +142,9 @@
       <span id="eventCaptureStatus" class="note"></span>
     </div>
     <p class="note">
-      Written on a published state change: 15 s before and after,
-      raw PCM, with the decision that caused it. Browser playback is
+      <span id="eventsHelp">Written on a published change: 15 s before
+      and after, raw PCM, with the decision that caused it. Under V2 that
+      is a fan or compressor change, or a beep.</span> Browser playback is
       boosted by the selected gain; stored WAV files are unchanged.
     </p>
     <div class="event-tools">
@@ -132,6 +192,6 @@
   </section>
 </main>
 
-<script type="module" src="app.js?v=20261001-2"></script>
+<script type="module" src="app.js?v=20261001-4"></script>
 </body>
 </html>

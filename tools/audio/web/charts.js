@@ -49,7 +49,10 @@ function niceBounds(values) {
  * @param host      container element, emptied first
  * @param t         x values (seconds, any origin)
  * @param series    [{name, values}]
- * @param options   {height, states, zeroLine, outages}
+ * @param options   {height, states, strips, marks, zeroLine, outages}
+ *                  strips: [{name, values (true/false/null), colour}] one
+ *                  thin on/off strip per independent observation;
+ *                  marks: [{t, colour}] vertical ticks, for beeps.
  */
 export function lineChart(host, t, series, options = {}) {
   host.textContent = "";
@@ -59,7 +62,11 @@ export function lineChart(host, t, series, options = {}) {
   const left = 46;
   const right = 10;
   const top = 8;
-  const stripHeight = options.states ? 14 : 0;
+  const STRIP = 9;
+  const strips = options.strips || [];
+  const stripHeight = options.states
+    ? 14
+    : strips.length * (STRIP + 3);
   const bottom = 20 + stripHeight;
 
   const plotW = width - left - right;
@@ -184,6 +191,47 @@ export function lineChart(host, t, series, options = {}) {
       if (options.states[i] !== options.states[runStart]) flush(i);
     }
     flush(t.length - 1);
+  }
+
+  // One on/off strip per observation: nothing here says what the
+  // observations add up to.
+  strips.forEach((strip, row) => {
+    const stripY = top + plotH + 6 + row * (STRIP + 3);
+    let runStart = 0;
+
+    const flush = (endIndex) => {
+      if (strip.values[runStart]) {
+        const x0 = x(t[runStart]);
+        const x1 = x(t[Math.min(endIndex, t.length - 1)]);
+        svg.append(el("rect", {
+          x: x0, y: stripY, width: Math.max(1, x1 - x0),
+          height: STRIP, fill: strip.colour || "#4a5162",
+        }));
+      }
+      runStart = endIndex;
+    };
+
+    for (let i = 1; i < t.length; i++) {
+      if (strip.values[i] !== strip.values[runStart]) flush(i);
+    }
+    flush(t.length - 1);
+
+    const name = el("text", {
+      x: left - 6, y: stripY + STRIP - 1, "text-anchor": "end",
+      fill: "#949bab", "font-size": "8",
+    });
+    name.textContent = strip.name;
+    svg.append(name);
+  });
+
+  for (const mark of options.marks || []) {
+    if (mark.t < t0 || mark.t > t1) continue;
+
+    svg.append(el("line", {
+      x1: x(mark.t), x2: x(mark.t), y1: top, y2: top + plotH,
+      stroke: mark.colour || "#e0c341", "stroke-width": 1.5,
+      opacity: 0.9,
+    }));
   }
 
   // x labels

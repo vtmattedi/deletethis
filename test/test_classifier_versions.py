@@ -17,7 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import synthetic  # noqa: E402
 from backend import config as config_module  # noqa: E402
 from backend.app import create_app, load_saved_config  # noqa: E402
-from backend.classifier import ClassifierService  # noqa: E402
+from backend.classifier import (  # noqa: E402
+    ClassifierService,
+    ObservationService,
+    make_classifier_service,
+)
 from backend.config import (  # noqa: E402
     RESULTS,
     RESULTS_V2,
@@ -32,12 +36,15 @@ from classifier import v1 as rules_v1  # noqa: E402
 from classifier import v2 as rules_v2  # noqa: E402
 from classifier.common import COMPRESSOR, FAN, OFF, STATES, Smoother  # noqa: E402
 from classifier.v1 import Thresholds, classify  # noqa: E402
+from classifier.detectors.arrays import scalarise  # noqa: E402
 from classifier.v2 import (  # noqa: E402
     STABILITY_FEATURES,
     TEMPORAL_FILL,
-    ThresholdsV2,
-    classify_v2,
-    classify_v2_codes,
+    CompressorConfig,
+    FanConfig,
+    ObservationRules,
+    detect_compressor,
+    detect_fan,
 )
 from features import (  # noqa: E402
     TEMPORAL_FEATURES,
@@ -62,112 +69,61 @@ def values(**overrides):
     return base
 
 
-class V2RuleTests(unittest.TestCase):
+class FanDetectorTests(unittest.TestCase):
     def setUp(self):
-        self.rule = ThresholdsV2()
-
-    def test_compressor_wins_over_fan_evidence(self):
-        state = classify_v2(values(**{"30-80": -30.0}), self.rule)
-        self.assertEqual(state, COMPRESSOR)
-
-        # ...even when the fan evidence is perfect and stationary.
-        state = classify_v2(
-            values(**{"30-80": -30.0, "1k-2k_std": 0.1}), self.rule
-        )
-        self.assertEqual(state, COMPRESSOR)
+        self.config = FanConfig()
 
     def test_fan_energy_and_low_std_is_fan(self):
-        self.assertEqual(classify_v2(values(), self.rule), FAN)
+        self.assertTrue(detect_fan(values(), self.config))
 
-    def test_fan_energy_with_high_std_is_off(self):
-        noisy = values(**{"1k-2k_std": self.rule.stability_threshold + 5})
-        self.assertEqual(classify_v2(noisy, self.rule), OFF)
+    def test_fan_energy_with_high_std_is_not_fan(self):
+        noisy = values(**{"1k-2k_std": self.config.stability_threshold + 5})
+        self.assertFalse(detect_fan(noisy, self.config))
 
-    def test_low_energy_and_low_std_is_off(self):
+    def test_low_energy_is_not_fan(self):
         quiet = values(**{"500-1k": -80.0, "1k-2k": -80.0})
-        self.assertEqual(classify_v2(quiet, self.rule), OFF)
+        self.assertFalse(detect_fan(quiet, self.config))
 
     def test_stability_is_inclusive_at_the_threshold(self):
-        edge = values(**{"1k-2k_std": self.rule.stability_threshold})
-        self.assertEqual(classify_v2(edge, self.rule), FAN)
+        edge = values(**{"1k-2k_std": self.config.stability_threshold})
+        self.assertTrue(detect_fan(edge, self.config))
 
     def test_gate_does_not_trust_a_short_history(self):
-        # A std over a couple of windows is near zero: everything looks
-        # stationary. The gate must not promote it to FAN.
         fresh = values(**{TEMPORAL_FILL: 0.2, "1k-2k_std": 0.0})
-        self.assertEqual(classify_v2(fresh, self.rule), OFF)
+        self.assertFalse(detect_fan(fresh, self.config))
 
         ready = values(**{
-            TEMPORAL_FILL: self.rule.stability_min_seconds,
+            TEMPORAL_FILL: self.config.stability_min_seconds,
             "1k-2k_std": 0.0,
         })
-        self.assertEqual(classify_v2(ready, self.rule), FAN)
+        self.assertTrue(detect_fan(ready, self.config))
 
-    def test_missing_or_nan_stability_is_never_fan(self):
+    def test_nan_stability_is_never_fan(self):
         nan = values(**{"1k-2k_std": float("nan")})
-        self.assertEqual(classify_v2(nan, self.rule), OFF)
-
-        missing = values()
-        del missing["1k-2k_std"]
-        with self.assertRaises(KeyError):
-            classify_v2(missing, self.rule)
+        self.assertFalse(detect_fan(nan, self.config))
 
     def test_either_mode_needs_only_one_fan_band(self):
         one_band = values(**{"500-1k": -80.0})
-        both = ThresholdsV2(fan_require_both=True)
-        either = ThresholdsV2(fan_require_both=False)
 
-        self.assertEqual(classify_v2(one_band, both), OFF)
-        self.assertEqual(classify_v2(one_band, either), FAN)
+        self.assertFalse(detect_fan(one_band, FanConfig(require_both=True)))
+        self.assertTrue(detect_fan(one_band, FanConfig(require_both=False)))
 
     def test_alternative_stability_feature(self):
-        rule = ThresholdsV2(
+        config = FanConfig(
             stability_feature="500-1k_std", stability_threshold=2.0
         )
-        self.assertEqual(
-            classify_v2(values(**{"500-1k_std": 5.0, "1k-2k_std": 0.1}),
-                        rule),
-            OFF,
-        )
-        self.assertEqual(
-            classify_v2(values(**{"500-1k_std": 1.0, "1k-2k_std": 9.0}),
-                        rule),
-            FAN,
-        )
+        self.assertFalse(detect_fan(
+            values(**{"500-1k_std": 5.0, "1k-2k_std": 0.1}), config))
+        self.assertTrue(detect_fan(
+            values(**{"500-1k_std": 1.0, "1k-2k_std": 9.0}), config))
 
     def test_unknown_stability_feature_is_rejected(self):
         with self.assertRaises(ValueError):
-            ThresholdsV2(stability_feature="30-80")
-
-    def test_array_path_matches_scalar_path(self):
-        # The search runs this rule over arrays; live runs it on
-        # scalars. They must be the same function, so they agree.
-        rng = np.random.default_rng(0)
-        count = 2000
-        table = {
-            "30-80": rng.uniform(-70, -25, count),
-            "500-1k": rng.uniform(-75, -45, count),
-            "1k-2k": rng.uniform(-75, -45, count),
-            "1k-2k_std": rng.uniform(0, 12, count),
-            TEMPORAL_FILL: rng.uniform(0, 3, count),
-        }
-
-        for rule in (
-            ThresholdsV2(),
-            ThresholdsV2(fan_require_both=False, stability_threshold=3.0),
-        ):
-            codes = classify_v2_codes(table, rule)
-
-            for index in range(0, count, 7):
-                row = {name: float(col[index]) for name, col in table.items()}
-                self.assertEqual(
-                    STATES[int(codes[index])], classify_v2(row, rule)
-                )
+            FanConfig(stability_feature="30-80")
 
     def test_names_agree_with_the_feature_extractor(self):
         self.assertEqual(TEMPORAL_FILL, FEATURES_TEMPORAL_FILL)
         self.assertTrue(set(STABILITY_FEATURES) <= set(TEMPORAL_FEATURES))
-        # Spelled out twice in the API model; they must not drift.
         self.assertEqual(
             set(ConfigPatch.model_fields["fanStabilityFeature"]
                 .annotation.__args__[0].__args__),
@@ -183,14 +139,108 @@ class V2RuleTests(unittest.TestCase):
         windows = extractor.push(samples)
         fill = [w.diagnostics[TEMPORAL_FILL] for w in windows]
 
-        # Grows from one window's worth, then saturates at the 2 s span.
         self.assertAlmostEqual(fill[0], 512 / 16000)
         self.assertEqual(fill, sorted(fill))
         self.assertAlmostEqual(fill[-1], 2.0, places=1)
 
-        # Bookkeeping, not a measurement: not a dataset column.
         from features import FEATURE_NAMES
         self.assertNotIn(TEMPORAL_FILL, FEATURE_NAMES)
+
+
+class CompressorDetectorTests(unittest.TestCase):
+    def test_threshold_is_inclusive(self):
+        config = CompressorConfig(threshold=-38.0)
+
+        self.assertTrue(detect_compressor({"30-80": -38.0}, config))
+        self.assertTrue(detect_compressor({"30-80": -20.0}, config))
+        self.assertFalse(detect_compressor({"30-80": -38.1}, config))
+
+    def test_it_reads_one_band_only(self):
+        # Nothing about the fan can change it.
+        config = CompressorConfig()
+
+        for fan_band in (-90.0, -40.0):
+            self.assertTrue(detect_compressor(
+                values(**{"30-80": -30.0, "500-1k": fan_band,
+                          "1k-2k": fan_band, "1k-2k_std": 50.0}),
+                config))
+
+
+class RulesTests(unittest.TestCase):
+    def setUp(self):
+        self.rules = ObservationRules()
+
+    def test_fan_and_compressor_can_both_be_true(self):
+        seen = self.rules.observe(values(**{"30-80": -30.0}))
+
+        self.assertTrue(seen.fan_detected)
+        self.assertTrue(seen.compressor_detected)
+
+    def test_compressor_does_not_suppress_the_fan(self):
+        quiet = self.rules.observe(values())
+        loud = self.rules.observe(values(**{"30-80": -30.0}))
+
+        self.assertEqual(quiet.fan_detected, loud.fan_detected)
+
+    def test_fan_without_compressor(self):
+        seen = self.rules.observe(values())
+        self.assertEqual((seen.fan_detected, seen.compressor_detected),
+                         (True, False))
+
+    def test_compressor_without_fan_evidence_is_still_compressor(self):
+        seen = self.rules.observe(values(**{
+            "30-80": -30.0, "500-1k": -90.0, "1k-2k": -90.0,
+        }))
+        self.assertEqual((seen.fan_detected, seen.compressor_detected),
+                         (False, True))
+
+    def test_neither(self):
+        seen = self.rules.observe(values(**{
+            "30-80": -70.0, "500-1k": -90.0, "1k-2k": -90.0,
+        }))
+        self.assertEqual((seen.fan_detected, seen.compressor_detected),
+                         (False, False))
+
+    def test_legacy_state_is_only_a_display_fold(self):
+        cases = [
+            ((False, False), OFF), ((True, False), FAN),
+            ((True, True), COMPRESSOR), ((False, True), COMPRESSOR),
+        ]
+        for (fan, compressor), expected in cases:
+            seen = rules_v2.AcousticObservations(fan, compressor)
+            self.assertEqual(seen.legacy_state(), expected)
+
+    def test_array_path_matches_scalar_path(self):
+        rng = np.random.default_rng(0)
+        count = 2000
+        table = {
+            "30-80": rng.uniform(-70, -25, count),
+            "500-1k": rng.uniform(-75, -45, count),
+            "1k-2k": rng.uniform(-75, -45, count),
+            "1k-2k_std": rng.uniform(0, 12, count),
+            TEMPORAL_FILL: rng.uniform(0, 3, count),
+        }
+
+        for rules in (
+            ObservationRules(),
+            ObservationRules(
+                fan=FanConfig(require_both=False, stability_threshold=3.0)
+            ),
+        ):
+            fan, compressor = rules.observe_arrays(table)
+
+            for index in range(0, count, 7):
+                row = {name: float(col[index]) for name, col in table.items()}
+                seen = rules.observe(row)
+                self.assertEqual(seen.fan_detected, bool(fan[index]))
+                self.assertEqual(
+                    seen.compressor_detected, bool(compressor[index])
+                )
+
+    def test_scalarise_returns_python_bool_for_scalars(self):
+        self.assertIs(scalarise(np.bool_(True)), True)
+        self.assertEqual(scalarise(np.array([True, False])).tolist(),
+                         [True, False])
 
 
 class LegacySmoother:
@@ -310,7 +360,7 @@ class ConfigVersionTests(unittest.TestCase):
             api["fanStabilityMinSeconds"],
             rules_v2.DEFAULT_FAN_STABILITY_MIN_SECONDS,
         )
-        self.assertIsInstance(config.rule(), ThresholdsV2)
+        self.assertIsInstance(config.rule(), ObservationRules)
         self.assertIsInstance(ClassifierConfig().rule(), Thresholds)
 
     def test_v2_defaults_keep_the_compressor_threshold_in_use(self):
@@ -485,14 +535,16 @@ class EventMetadataTests(unittest.TestCase):
                     timeline["classifierVersion"], config.version
                 )
                 self.assertGreater(timeline["count"], 100)
-                self.assertIn("1k-2k_std", timeline["columns"])
+                self.assertIn("rms", timeline["columns"])
 
 
 class ServiceSnapshotTests(unittest.TestCase):
-    def test_live_snapshot_exposes_the_v2_inputs(self):
-        service = ClassifierService(
+    def test_live_snapshot_exposes_observations_not_a_state(self):
+        service = make_classifier_service(
             16000, ClassifierConfig.for_version("v2")
         )
+        self.assertIsInstance(service, ObservationService)
+
         samples = synthetic.to_counts(
             synthetic.make("fan_clean", seconds=5)
         ).astype(np.int32)
@@ -503,17 +555,26 @@ class ServiceSnapshotTests(unittest.TestCase):
         api = service.current().to_api()
 
         self.assertEqual(api["classifierVersion"], "v2")
-        for name in ("1k-2k_std", "500-1k_std", "2k-4k_std",
-                     "spectral_flux"):
+        self.assertEqual(api["observations"],
+                         {"fan": True, "compressor": False})
+        self.assertIn("lastBeep", api)
+        self.assertIn("fanEvidence", api)
+        for name in ("1k-2k_std", "spectral_flux"):
             self.assertIn(name, api["features"])
 
-        self.assertEqual(api["state"], "FAN")
+    def test_v1_still_gets_the_original_service(self):
+        service = make_classifier_service(16000, ClassifierConfig())
+        self.assertIsInstance(service, ClassifierService)
 
     def test_a_running_service_cannot_change_version(self):
         service = ClassifierService(16000, ClassifierConfig())
 
         with self.assertRaises(ValueError):
             service.apply_config(ClassifierConfig.for_version("v2"))
+
+        v2 = ObservationService(16000, ClassifierConfig.for_version("v2"))
+        with self.assertRaises(ValueError):
+            v2.apply_config(ClassifierConfig())
 
 
 class VersionedApiTests(unittest.TestCase):

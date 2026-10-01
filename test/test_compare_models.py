@@ -98,19 +98,28 @@ class CompareModelsTests(unittest.TestCase):
 
     def test_published_path_matches_the_evaluator(self):
         # Predictions must reach the score through the same hold the
-        # rule uses, or "model vs rule" compares different things.
-        from classifier.v2 import ThresholdsV2
+        # detector uses, or "model vs rule" compares different things.
         from backend.config import ClassifierConfig
 
-        rule = ClassifierConfig.for_version("v2").rule()
+        rules = ClassifierConfig.for_version("v2").rule()
         dataset = self.dataset()
-        codes = dataset.fast.codes(rule)
+        candidates = dataset.fast.candidates(rules)
+        theirs = dataset.fast.published(rules)
 
-        ours = dataset.published(codes)
-        theirs = dataset.fast.published(rule)
+        for observation in ev.OBSERVATIONS:
+            ours = dataset.published(candidates[observation])
 
-        for left, right in zip(ours, theirs):
-            self.assertTrue(np.array_equal(left, right))
+            for left, right in zip(ours, theirs[observation]):
+                self.assertTrue(np.array_equal(left, right))
+
+    def test_models_are_binary_per_observation(self):
+        dataset = self.dataset()
+
+        for observation in ev.OBSERVATIONS:
+            labels = set(np.unique(dataset.truth[observation]).tolist())
+            self.assertLessEqual(labels, {ev.UNSCORED, 0, 1})
+            self.assertEqual(len(dataset.truth[observation]),
+                             len(dataset.X))
 
     def test_the_comparison_runs_and_writes_its_artifacts(self):
         out = self.root / "models"
@@ -134,19 +143,26 @@ class CompareModelsTests(unittest.TestCase):
         self.assertEqual(summary["folds"], 4)
         self.assertEqual(summary["materialGain"], 0.02)
 
-        names = {row["model"] for row in summary["rows"]}
-        self.assertTrue(
-            {"v1 rule", "v2 rule", "logistic", "forest"} <= names
-        )
-        self.assertIn("tree_depth3", names)
+        self.assertEqual(set(summary["rows"]), {"fan", "compressor"})
 
-        # Clean scenarios are easy: nothing should be worse than chance.
-        for row in summary["rows"]:
-            if row["model"].startswith("tree_depth1"):
-                continue            # a stump, deliberately degenerate
-            self.assertGreater(row["balanced"], 0.5, row["model"])
+        for observation, rows in summary["rows"].items():
+            names = {row["model"] for row in rows}
+            self.assertTrue(
+                {"v1 rule", "v2 detector", "logistic", "forest"} <= names,
+                observation,
+            )
+            self.assertIn("tree_depth3", names)
 
-        self.assertIn("verdict", summary)
+            # Clean scenarios are easy: nothing should be worse than
+            # chance.
+            for row in rows:
+                if row["model"].startswith("tree_depth1"):
+                    continue        # a stump, deliberately degenerate
+                self.assertGreater(row["balanced"], 0.5,
+                                   (observation, row["model"]))
+
+            self.assertIn(observation, summary["verdicts"])
+
         self.assertIn("|---", (out / "tree_rules.txt").read_text())
 
     def test_the_backend_never_imports_the_analysis_tools(self):

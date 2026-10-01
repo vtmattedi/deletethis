@@ -116,6 +116,21 @@ li.event.open { background: #20242e; }
 h3 { font-size: 12px; margin: 16px 0 6px; color: var(--dim);
      text-transform: uppercase; letter-spacing: .06em; }
 
-/* Classifier v2: is the fan's band level holding still? */
+/* Classifier v2: three observations, none of them a "state". */
 dd.steady { color: var(--fan); }
 dd.moving { color: var(--compressor); }
+.obs-value { font-size: 26px; font-weight: 700; letter-spacing: -.01em;
+             color: var(--dim); }
+.obs-value.yes { color: var(--fan); }
+.obs-value.no { color: var(--dim); }
+.obs-value.unknown { color: var(--dim); font-weight: 500; }
+#compressorValue.yes { color: var(--compressor); }
+#beepValue.yes { color: #e0c341; }
+label.inline { display: inline-flex; grid-template-columns: none; gap: 6px; }
+label.inline input { width: auto; }
+.event-kind { padding: 2px 8px; border-radius: 999px; font-size: 12px;
+              background: #343946; color: var(--text); }
+.kind-fan { background: #163f29; color: #72d99a; }
+.kind-compressor { background: #4a2e18; color: #f0a468; }
+.kind-beep { background: #44401a; color: #e0c341; }
+.command-context { margin-top: 10px; }

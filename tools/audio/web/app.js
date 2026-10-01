@@ -46,10 +46,31 @@ const V2_SETTINGS = [
     "spectral_flux_median", "spectral_flux_std",
   ]],
   ["fanStabilityMinSeconds", "stability history s", "number", 0.25],
+  ["beepMinContrastDb", "beep contrast dB", "number", 0.5],
+  ["beepEdgeContrastDb", "beep edge contrast dB", "number", 0.5],
+  ["beepMinLevelDb", "beep min level dB", "number", 1],
+  ["beepMinMs", "beep min ms", "number", 5],
+  ["beepMaxMs", "beep max ms", "number", 10],
+  ["beepMinHz", "beep min Hz", "number", 5],
+  ["beepMaxHz", "beep max Hz", "number", 5],
+  ["beepMaxPeakSpreadHz", "beep pitch spread Hz", "number", 5],
 ];
 let activeSettings = SETTINGS;
 
 const $ = (id) => document.getElementById(id);
+
+// "Really on / really off" for a v2 fan or compressor review.
+function valueSelect(value) {
+  const select = document.createElement("select");
+  for (const [text, key] of [["Select…", ""], ["on", "on"], ["off", "off"]]) {
+    const option = document.createElement("option");
+    option.value = key;
+    option.textContent = text;
+    select.append(option);
+  }
+  select.value = value === true ? "on" : value === false ? "off" : "";
+  return select;
+}
 const DEFAULT_PLAYBACK_GAIN_DB = 6;
 
 let lastEventCount = -1;
@@ -58,6 +79,9 @@ let eventPage = 1;
 let eventPages = 0;
 const EVENT_PAGE_SIZE = 10;
 const selectedEventIds = new Set();
+// Every event the list has shown, so a bulk review knows which schema
+// each selected one takes.
+const knownEvents = new Map();
 let visibleEventIds = [];
 let rangeSelectionAnchor = null;
 let audioPlaybackContext = null;
@@ -392,6 +416,23 @@ function applyConfig(config) {
 
 $("saveSettings").addEventListener("click", saveSettings);
 
+function setObservation(id, value) {
+  const element = $(id);
+  if (value === true) {
+    element.textContent = "DETECTED";
+    element.className = "obs-value yes";
+  } else if (value === false) {
+    element.textContent = "not detected";
+    element.className = "obs-value no";
+  } else {
+    element.textContent = "waiting…";
+    element.className = "obs-value unknown";
+  }
+}
+
+const yesNo = (value) => value === true ? "yes" : value === false ? "no" : "--";
+const seconds = (value) => value == null ? "--" : `${value.toFixed(1)} s`;
+
 function renderClassifier(data) {
   const config = data.config || {};
   const version = data.classifierVersion || config.classifierVersion;
@@ -399,33 +440,78 @@ function renderClassifier(data) {
 
   $("classifierVersion").textContent = version ? version.toUpperCase() : "--";
 
-  for (const id of ["dtStability", "ddStability", "dtThreshold", "ddThreshold"]) {
+  // v1 shows its one state; v2 shows three separate observations.
+  $("stateCard").hidden = v2;
+  for (const id of ["fanCard", "compressorCard", "beepCard", "v2Note",
+                    "commandCard"]) {
     $(id).hidden = !v2;
   }
   if (!v2) return;
 
-  const feature = config.fanStabilityFeature || "1k-2k_std";
-  const value = (data.features || {})[feature];
-  const limit = config.fanStabilityThreshold;
+  const seen = data.observations || {};
+  const candidates = data.candidates || {};
+  const held = data.stableSeconds || {};
+  const evidence = data.fanEvidence || {};
+  const features = data.features || {};
 
-  $("ddStability").textContent = value == null
+  setObservation("fanValue", seen.fan);
+  $("fanCandidate").textContent = yesNo(candidates.fan);
+  $("fanStable").textContent = seconds(held.fan);
+  $("fanEnergy").textContent = evidence.energy == null
     ? "--"
-    : `${formatFeatureValue(feature, value)} (${feature})`;
-  $("ddThreshold").textContent = limit == null ? "--" : `${limit} dB`;
-  // Steady means at or under the limit: that is what lets FAN through.
-  $("ddStability").className =
+    : evidence.energy ? "present" : "absent";
+
+  const feature = config.fanStabilityFeature || "1k-2k_std";
+  const value = features[feature];
+  const limit = config.fanStabilityThreshold;
+  $("fanStability").textContent = value == null
+    ? "--"
+    : `${formatFeatureValue(feature, value)} / ${limit} dB`;
+  // Steady means at or under the limit: both tests must pass for a fan.
+  $("fanStability").className =
     value == null || limit == null ? "" : value <= limit ? "steady" : "moving";
+
+  setObservation("compressorValue", seen.compressor);
+  $("compressorCandidate").textContent = yesNo(candidates.compressor);
+  $("compressorStable").textContent = seconds(held.compressor);
+  const level = features["30-80"];
+  $("compressorLevel").textContent = level == null
+    ? "--"
+    : `${level.toFixed(1)} dB (limit ${config.compressorThreshold})`;
+
+  const beep = data.lastBeep;
+  const count = data.beepCount ?? 0;
+  const beepValue = $("beepValue");
+  $("beepCount").textContent = String(count);
+  if (beep) {
+    const ago = Math.max(0, (data.streamSeconds ?? 0) - beep.streamSeconds);
+    beepValue.textContent = ago < 2 ? "BEEP" : `${ago.toFixed(0)} s ago`;
+    beepValue.className = ago < 2 ? "obs-value yes" : "obs-value no";
+    $("beepDuration").textContent = `${beep.durationMs.toFixed(0)} ms`;
+    $("beepPitch").textContent = `${beep.peakHz.toFixed(0)} Hz`;
+    $("beepContrast").textContent = `${beep.contrastDb.toFixed(1)} dB`;
+  } else {
+    beepValue.textContent = "none yet";
+    beepValue.className = "obs-value unknown";
+    for (const id of ["beepDuration", "beepPitch", "beepContrast"]) {
+      $(id).textContent = "--";
+    }
+  }
 }
 
 function render(data) {
-  const state = data.state || "--";
-  const element = $("state");
-  element.textContent = state;
-  element.className = "state-name state-" + state;
+  // v1 has one combined state; v2 has none (see renderClassifier), and
+  // its stableSeconds is per observation rather than a number.
+  if (data.classifierVersion !== "v2") {
+    const state = data.state || "--";
+    const element = $("state");
+    element.textContent = state;
+    element.className = "state-name state-" + state;
 
-  $("candidate").textContent = data.candidate || "--";
-  $("stable").textContent =
-    data.stableSeconds == null ? "--" : data.stableSeconds.toFixed(1) + " s";
+    $("candidate").textContent = data.candidate || "--";
+    $("stable").textContent = typeof data.stableSeconds === "number"
+      ? data.stableSeconds.toFixed(1) + " s" : "--";
+  }
 
   renderFeatures(data.features || {});
   renderClassifier(data);
@@ -538,13 +624,19 @@ async function loadEvents() {
     when.className = "when";
     when.textContent = event.time.replace("T", " ");
 
+    knownEvents.set(event.id, event);
+
     const what = document.createElement("strong");
-    what.textContent = `${event.from || "--"} → ${event.to}`;
+    what.textContent = eventLabel(event);
+    if (isV2(event)) {
+      what.className = `event-kind kind-${event.eventType}`;
+    }
 
     const review = document.createElement("span");
-    let correctness = event.review?.status === "reviewed"
-      ? (event.review.classificationCorrect ? "correct" : "incorrect")
-      : "unreviewed";
+    const verdict = verdictOf(event.review);
+    let correctness = verdict === null
+      ? "unreviewed"
+      : verdict ? "correct" : "incorrect";
     review.className = `review-status review-${correctness}`;
     review.textContent = correctness;
 
@@ -561,13 +653,17 @@ async function loadEvents() {
         const response = await fetch(`/api/events/${event.id}/review`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            classificationCorrect: true,
-            actualFrom: event.from || "UNKNOWN",
-            actualTo: event.to || "UNKNOWN",
-            interference: [],
-            notes: "",
-          }),
+          body: JSON.stringify(
+            isV2(event)
+              ? { correct: true, interference: [], notes: "" }
+              : {
+                classificationCorrect: true,
+                actualFrom: event.from || "UNKNOWN",
+                actualTo: event.to || "UNKNOWN",
+                interference: [],
+                notes: "",
+              },
+          ),
         });
         if (!response.ok) throw new Error("review request failed");
 
@@ -588,7 +684,7 @@ async function loadEvents() {
     held.className = "note";
     held.textContent =
       `${event.source === "manual" ? "manual · " : ""}` +
-      `held ${event.candidateHeldSeconds}s · ` +
+      `${isV2(event) ? "" : `held ${event.candidateHeldSeconds}s · `}` +
       `${event.audio.seconds}s audio`;
 
     const audio = document.createElement("audio");
@@ -599,6 +695,31 @@ async function loadEvents() {
 
     item.append(select, when, what, review, quickCorrect, held, audio);
     list.append(item);
+  }
+}
+
+const isV2 = (event) => event.classifierVersion === "v2" && !!event.eventType;
+
+// The review verdict, whichever schema the event uses.
+function verdictOf(review) {
+  if (review?.status !== "reviewed") return null;
+  return isV2Review(review) ? review.correct : review.classificationCorrect;
+}
+const isV2Review = (review) => review && review.correct !== undefined;
+
+function eventLabel(event) {
+  if (!isV2(event)) return `${event.from || "--"} → ${event.to}`;
+
+  switch (event.eventType) {
+    case "fan": return event.to ? "FAN ON" : "FAN OFF";
+    case "compressor": return event.to ? "COMPRESSOR ON" : "COMPRESSOR OFF";
+    case "beep": {
+      const b = event.beep || {};
+      return b.peakHz
+        ? `BEEP · ${b.durationMs.toFixed(0)} ms at ${b.peakHz.toFixed(0)} Hz`
+        : "BEEP";
+    }
+    default: return event.eventType.toUpperCase();
   }
 }
 
@@ -628,13 +749,31 @@ function openBulkReview() {
   const identifiers = [...selectedEventIds];
   if (!identifiers.length) return;
 
+  // The two classifier versions are reviewed differently, so one
+  // request covers one version.
+  const known = identifiers.map((id) => knownEvents.get(id));
+  const v2Count = known.filter((event) => event && isV2(event)).length;
+  const v1Count = known.filter((event) => event && !isV2(event)).length;
+  if (v2Count + v1Count !== identifiers.length || (v2Count && v1Count)) {
+    $("bulkActionNote").textContent =
+      "Select events of one classifier version, from the list, to review " +
+      "them together.";
+    return;
+  }
+  const v2 = v2Count > 0;
+  // A wrong fan/compressor event must say what it really was.
+  const needsValue = known.some(
+    (event) => event.eventType === "fan" || event.eventType === "compressor",
+  );
+
   const panel = $("bulkReview");
   const body = $("bulkReviewBody");
   $("bulkActionNote").textContent = "";
   $("bulkReviewSummary").textContent =
     `This review will be applied to ${identifiers.length} selected event` +
-    `${identifiers.length === 1 ? "" : "s"}. Correct uses each event's ` +
-    "own classifier transition.";
+    `${identifiers.length === 1 ? "" : "s"}. ` + (v2
+      ? "Correct means the detector was right about each one."
+      : "Correct uses each event's own classifier transition.");
   body.textContent = "";
 
   const form = document.createElement("div");
@@ -677,10 +816,16 @@ function openBulkReview() {
     form.append(label);
   };
 
-  const actualFrom = stateSelect();
-  const actualTo = stateSelect();
-  field("Actual from", actualFrom);
-  field("Actual to", actualTo);
+  // v1: the state before and after. v2: what the observation really was
+  // afterwards (the second select is unused there).
+  const actualFrom = v2 ? valueSelect() : stateSelect();
+  const actualTo = v2 ? valueSelect() : stateSelect();
+  if (v2) {
+    if (needsValue) field("Really, afterwards", actualFrom);
+  } else {
+    field("Actual from", actualFrom);
+    field("Actual to", actualTo);
+  }
 
   const tags = document.createElement("div");
   tags.className = "review-tags";
@@ -713,7 +858,9 @@ function openBulkReview() {
   correct.addEventListener("click", () => {
     verdict = true;
     showVerdict();
-    message.textContent = "Each event will use its own classifier labels.";
+    message.textContent = v2
+      ? "Each event will be confirmed as the detector saw it."
+      : "Each event will use its own classifier labels.";
   });
   wrong.addEventListener("click", () => {
     verdict = false;
@@ -727,21 +874,32 @@ function openBulkReview() {
       message.textContent = "Choose Correct or Wrong.";
       return;
     }
-    if (verdict === false && (!actualFrom.value || !actualTo.value)) {
+    if (verdict === false && v2 && needsValue && !actualFrom.value) {
+      message.textContent = "Say what it really was, afterwards.";
+      return;
+    }
+    if (verdict === false && !v2 && (!actualFrom.value || !actualTo.value)) {
       message.textContent = "Choose both actual states for an incorrect review.";
       return;
     }
 
     const payload = {
       ids: identifiers,
-      classificationCorrect: verdict,
       interference: [...tags.querySelectorAll("input:checked")]
         .map((input) => input.value),
       notes: notes.value,
     };
-    if (verdict === false) {
-      payload.actualFrom = actualFrom.value;
-      payload.actualTo = actualTo.value;
+    if (v2) {
+      payload.correct = verdict;
+      if (verdict === false && needsValue) {
+        payload.actualValue = actualFrom.value === "on";
+      }
+    } else {
+      payload.classificationCorrect = verdict;
+      if (verdict === false) {
+        payload.actualFrom = actualFrom.value;
+        payload.actualTo = actualTo.value;
+      }
     }
 
     save.disabled = true;
@@ -753,7 +911,9 @@ function openBulkReview() {
     });
     if (!response.ok) {
       save.disabled = false;
-      message.textContent = "Reviews could not be saved. Refresh and retry.";
+      const detail = (await response.json().catch(() => ({}))).detail;
+      message.textContent = detail?.message ||
+        "Reviews could not be saved. Refresh and retry.";
       return;
     }
 
@@ -830,6 +990,29 @@ async function recordEvent() {
 }
 
 $("recordEvent").addEventListener("click", recordEvent);
+
+async function markCommand() {
+  const command = $("commandName").value.trim();
+  const note = $("commandNote");
+  if (!command) {
+    note.textContent = "Name the command first.";
+    return;
+  }
+  const response = await fetch("/api/commands", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      command,
+      expectedBeep: $("commandExpectBeep").checked,
+    }),
+  });
+  note.textContent = response.ok
+    ? `Marked ${command} at ${new Date().toLocaleTimeString()}. Events ` +
+      "within 10 s will carry it as context."
+    : "Could not record the command.";
+}
+
+$("markCommand").addEventListener("click", markCommand);
 $("eventSearchButton").addEventListener("click", () => {
   eventPage = 1;
   loadEvents();
@@ -909,6 +1092,18 @@ async function loadHistory() {
 
   legend($("historyLegend"), ["rms", ...BANDS]);
 
+  // v2 rows carry the two observations (a downsampled bucket holds the
+  // fraction of it that was on) and a running beep count.
+  const asBool = (v) => v == null ? null : v >= 0.5;
+  const hasV2 = (c.fan_detected || []).some((v) => v != null);
+  const counts = c.beep_count || [];
+  const beepMarks = [];
+  for (let i = 1; i < counts.length; i++) {
+    if (counts[i] != null && counts[i - 1] != null && counts[i] > counts[i - 1]) {
+      beepMarks.push({ t: c.t[i] });
+    }
+  }
+
   lineChart(
     $("historyChart"),
     c.t || [],
@@ -918,7 +1113,15 @@ async function loadHistory() {
     ],
     {
       height: 200,
-      states: c.state || [],
+      ...(hasV2
+        ? {
+          strips: [
+            { name: "fan", values: c.fan_detected.map(asBool), colour: "#1f9d55" },
+            { name: "comp", values: c.compressor_detected.map(asBool), colour: "#d2691e" },
+          ],
+          marks: beepMarks,
+        }
+        : { states: c.state || [] }),
       outages,
       xFormat: (v) => new Date(v * 1000).toLocaleTimeString(),
       emptyText: "no history recorded in this range yet",
@@ -957,7 +1160,195 @@ function closeEventDetail() {
   }
 }
 
+function buildReviewV2(meta) {
+  const form = document.createElement("div");
+  form.className = "review-form";
+  form.append(heading("Review"));
+
+  const review = meta.review || {};
+  let verdict = review.status === "reviewed" ? review.correct : null;
+  const observation = meta.eventType === "fan" ||
+    meta.eventType === "compressor";
+
+  const choices = document.createElement("div");
+  choices.className = "review-actions";
+  const correct = document.createElement("button");
+  const wrong = document.createElement("button");
+  const save = document.createElement("button");
+  const message = document.createElement("span");
+  correct.type = wrong.type = save.type = "button";
+  correct.textContent = "Correct";
+  wrong.textContent = "Wrong";
+  save.textContent = "Save review";
+  correct.className = wrong.className = "review-choice";
+  message.className = "note";
+  choices.append(correct, wrong, save, message);
+  form.append(choices);
+
+  const field = (label, control) => {
+    const wrapper = document.createElement("label");
+    const name = document.createElement("span");
+    name.textContent = label;
+    wrapper.append(name, control);
+    form.append(wrapper);
+  };
+
+  const really = valueSelect(review.actualValue);
+  if (observation) {
+    field(`Was the ${meta.eventType} really on, afterwards?`, really);
+  }
+
+  const tags = document.createElement("div");
+  tags.className = "review-tags";
+  const selected = new Set(review.interference || []);
+  for (const tag of ["talking", "printer", "tv", "other"]) {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = tag;
+    input.checked = selected.has(tag);
+    const text = document.createElement("span");
+    text.textContent = tag;
+    label.append(input, text);
+    tags.append(label);
+  }
+  field("Interference", tags);
+
+  const notes = document.createElement("textarea");
+  notes.value = review.notes || "";
+  notes.placeholder = "Optional notes";
+  field("Notes", notes);
+
+  const hint = document.createElement("p");
+  hint.className = "note";
+  hint.textContent = meta.eventType === "beep"
+    ? "Correct: there really was a beep. Wrong: there was not."
+    : observation
+      ? "Correct: the detector's new value was right. Wrong: say what it " +
+        "really was."
+      : "Correct: the capture is what you wanted.";
+  form.append(hint);
+
+  const showVerdict = () => {
+    correct.classList.toggle("active", verdict === true);
+    wrong.classList.toggle("active", verdict === false);
+  };
+  correct.addEventListener("click", () => {
+    verdict = true;
+    if (observation) really.value = meta.to ? "on" : "off";
+    showVerdict();
+  });
+  wrong.addEventListener("click", () => {
+    verdict = false;
+    if (observation) really.value = meta.to ? "off" : "on";
+    showVerdict();
+  });
+  showVerdict();
+
+  save.addEventListener("click", async () => {
+    if (verdict === null) {
+      message.textContent = "Choose Correct or Wrong.";
+      return;
+    }
+    if (observation && verdict === false && !really.value) {
+      message.textContent = "Say what it really was, afterwards.";
+      return;
+    }
+    const body = {
+      correct: verdict,
+      interference: [...tags.querySelectorAll("input:checked")]
+        .map((input) => input.value),
+      notes: notes.value,
+    };
+    if (observation && verdict === false) {
+      body.actualValue = really.value === "on";
+    }
+
+    save.disabled = true;
+    message.textContent = "Saving…";
+    const response = await fetch(`/api/events/${meta.id}/review`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    save.disabled = false;
+    message.textContent = response.ok
+      ? "Review saved." : "Review could not be saved.";
+    if (response.ok) {
+      closeEventDetail();
+      loadEvents();
+    }
+  });
+
+  return form;
+}
+
+// The command the operator said they sent near an event, if any.
+function buildCommandContext(meta) {
+  const box = document.createElement("div");
+  box.className = "command-context";
+  box.append(heading("command context"));
+
+  const reopen = () => openEvent(meta.id, document.querySelector("li.event.open"));
+
+  if (meta.commandContext) {
+    const c = meta.commandContext;
+    box.append(table([
+      ["command", c.command],
+      ["expected a beep", c.expectedBeep ? "yes" : "no"],
+      ["relative to this event",
+        c.secondsFromEvent == null ? "set by hand"
+          : `${c.secondsFromEvent > 0 ? "+" : ""}${c.secondsFromEvent} s`],
+      ["note", c.note || "--"],
+    ]));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Remove";
+    remove.addEventListener("click", async () => {
+      await fetch(`/api/events/${meta.id}/command-context`, { method: "DELETE" });
+      reopen();
+    });
+    box.append(remove);
+    return box;
+  }
+
+  const note = document.createElement("p");
+  note.className = "note";
+  note.textContent =
+    "No command was marked within 10 s. If one was sent, attach it here.";
+  const name = document.createElement("input");
+  name.placeholder = "POWER";
+  name.setAttribute("list", "commandNames");
+  const expect = document.createElement("input");
+  expect.type = "checkbox";
+  expect.checked = true;
+  const expectLabel = document.createElement("label");
+  expectLabel.className = "inline";
+  const expectText = document.createElement("span");
+  expectText.textContent = "a beep is expected";
+  expectLabel.append(expect, expectText);
+  const attach = document.createElement("button");
+  attach.type = "button";
+  attach.textContent = "Attach";
+  attach.addEventListener("click", async () => {
+    if (!name.value.trim()) return;
+    await fetch(`/api/events/${meta.id}/command-context`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        command: name.value.trim(),
+        expectedBeep: expect.checked,
+      }),
+    });
+    reopen();
+  });
+  box.append(note, name, expectLabel, attach);
+  return box;
+}
+
 function buildReview(meta) {
+  if (isV2(meta)) return buildReviewV2(meta);
+
   const form = document.createElement("div");
   form.className = "review-form";
   form.append(heading("Review"));
@@ -1097,8 +1488,8 @@ async function openEvent(id, item) {
   const title = document.createElement("div");
   title.className = "state-name";
   title.style.fontSize = "24px";
-  title.textContent = `Name: ${meta.from || "--"} → ${meta.to}`;
-  title.classList.add("state-" + meta.to);
+  title.textContent = `Name: ${eventLabel(meta)}`;
+  if (!isV2(meta)) title.classList.add("state-" + meta.to);
   body.append(title);
 
   body.append(heading("recording"));
@@ -1111,6 +1502,7 @@ async function openEvent(id, item) {
   body.append(audio);
 
   body.append(buildReview(meta));
+  if (isV2(meta)) body.append(buildCommandContext(meta));
 
   body.append(heading("graph"));
   const chartLegend = document.createElement("div");
@@ -1126,18 +1518,39 @@ async function openEvent(id, item) {
   const grid = document.createElement("div");
   grid.className = "grid2";
   const left = document.createElement("div");
-  left.append(heading("transition"), table([
-    ["id", meta.id],
-    ["source", meta.source || "transition"],
-    ["time", meta.time.replace("T", " ")],
-    ["classifier", `${meta.from || "--"} → ${meta.to}`],
-    // Events recorded before versions existed carry no version: v1.
-    ["classifier version", (meta.classifierVersion || "v1").toUpperCase() +
-      (meta.classifierVersion ? "" : " (recorded before versions)")],
-    ["candidate held", meta.candidateHeldSeconds + " s"],
-    ["audio", `${meta.audio.seconds} s ` +
-      `(${meta.audio.preSeconds} before / ${meta.audio.postSeconds} after)`],
-  ]));
+  const observed = meta.observations || {};
+  const rows = isV2(meta)
+    ? [
+      ["id", meta.id],
+      ["event", eventLabel(meta)],
+      ["source", meta.source || "transition"],
+      ["time", meta.time.replace("T", " ")],
+      ["fan at the time", yesNo(observed.fan)],
+      ["compressor at the time", yesNo(observed.compressor)],
+      ...(meta.eventType === "fan" || meta.eventType === "compressor"
+        ? [["held before publishing", meta.candidateHeldSeconds + " s"]] : []),
+      ...(meta.beep
+        ? [
+          ["beep duration", `${meta.beep.durationMs.toFixed(0)} ms`],
+          ["beep pitch", `${meta.beep.peakHz.toFixed(1)} Hz`],
+          ["beep contrast", `${meta.beep.contrastDb.toFixed(1)} dB`],
+          ["beep level", `${meta.beep.levelDb.toFixed(1)} dB`],
+        ] : []),
+      ["classifier version", "V2"],
+    ]
+    : [
+      ["id", meta.id],
+      ["source", meta.source || "transition"],
+      ["time", meta.time.replace("T", " ")],
+      ["classifier", `${meta.from || "--"} → ${meta.to}`],
+      // Events recorded before versions existed carry no version: v1.
+      ["classifier version", (meta.classifierVersion || "v1").toUpperCase() +
+        (meta.classifierVersion ? "" : " (recorded before versions)")],
+      ["candidate held", meta.candidateHeldSeconds + " s"],
+    ];
+  rows.push(["audio", `${meta.audio.seconds} s ` +
+    `(${meta.audio.preSeconds} before / ${meta.audio.postSeconds} after)`]);
+  left.append(heading(isV2(meta) ? "event" : "transition"), table(rows));
   const recorded = meta.featuresAtTransition || {};
   left.append(heading("stationarity at transition"), table(
     ["1k-2k_std", "500-1k_std", "2k-4k_std"].map((name) => [
@@ -1205,17 +1618,52 @@ async function openEvent(id, item) {
   const c = timeline.columns;
   legend(chartLegend, ["rms", ...BANDS]);
 
+  const v2Timeline = timeline.classifierVersion === "v2";
+  const beeps = timeline.beeps || [];
+
   lineChart(chart, c.t, [
     { name: "rms", values: c.rms },
     ...BANDS.map((b) => ({ name: b, values: c[b] })),
-  ], {
+  ], v2Timeline ? {
+    height: 240,
+    strips: [
+      { name: "fan", values: c.fan, colour: "#1f9d55" },
+      { name: "comp", values: c.compressor, colour: "#d2691e" },
+    ],
+    marks: beeps.map((b) => ({ t: b.startSeconds })),
+    zeroLine: true,
+    xFormat: (v) => v.toFixed(0) + "s",
+  } : {
     height: 220,
     states: c.state,
     zeroLine: true,
     xFormat: (v) => v.toFixed(0) + "s",
   });
 
-  note.textContent =
+  if (v2Timeline) {
+    body.insertBefore(heading("beep contrast"), body.querySelector(".grid2")
+      .previousElementSibling);
+    const contrastChart = document.createElement("div");
+    contrastChart.className = "chart";
+    body.insertBefore(contrastChart, body.querySelector(".grid2")
+      .previousElementSibling);
+    lineChart(contrastChart, c.t, [
+      { name: "contrast", values: c.beepContrast, colour: "#e0c341" },
+    ], {
+      height: 120,
+      marks: beeps.map((b) => ({ t: b.startSeconds })),
+      zeroLine: true,
+      xFormat: (v) => v.toFixed(0) + "s",
+    });
+  }
+
+  note.textContent = v2Timeline
+    ? `${timeline.count} windows, recomputed from the WAV with the ` +
+      `settings recorded in the event. The two strips are the published ` +
+      `fan and compressor observations, independently; yellow ticks are ` +
+      `beeps found in the audio. Near the left edge the strips are still ` +
+      `warming up, because this replay starts cold.`
+    : 
     `${timeline.count} windows, recomputed from the WAV with the ` +
     `settings recorded in the event. The strip is the published ` +
     `state; near the left edge it is still warming up, because this ` +

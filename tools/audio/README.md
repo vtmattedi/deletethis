@@ -316,8 +316,8 @@ failing case far better than any level does. Spectral tilt
 ## Classifier versions
 
 ```
-v1   30-80 Hz high -> COMPRESSOR; else 500-1k and 1k-2k high -> FAN; else OFF
-v2   the same, but FAN also needs a *stationary* fan spectrum
+v1   one state: 30-80 Hz high -> COMPRESSOR; else fan bands high -> FAN; else OFF
+v2   three independent observations: fan_detected, compressor_detected, beep
 ```
 
 v1 is frozen. It is the baseline, and the rule the events recorded
@@ -325,18 +325,100 @@ before v2 were classified by; a regression test replays today's
 Smoother against a verbatim copy of the old one and requires identical
 output, window for window.
 
-**Why v2.** Fan *energy* cannot tell a fan from speech, a printer or a
-television: all of them put real power in 500-1k and 1k-2k. What a fan
-does that they do not is hold still. Over two seconds its band level
-barely moves; speech and machinery keep changing. v2 adds one test,
-`1k-2k_std <= fanStabilityThreshold` (the standard deviation of that
-band's level over the last two seconds), and requires at least
-`fanStabilityMinSeconds` of history behind it, because a standard
-deviation over two windows is near zero and would make anything look
-stationary. This is **not** `holdSeconds`: the hold stops a short-lived
-candidate being *published*, stationarity says what the signal *is*,
-and a printer that runs for ten seconds outlasts any hold short enough
-to be useful.
+### What v2 reports, and what it refuses to
+
+| Observation | Type | Meaning |
+| --- | --- | --- |
+| `fan_detected` | bool | the fan spectrum is present and holding still |
+| `compressor_detected` | bool | sustained energy in 30-80 Hz |
+| `beep` | event | a short pure tone near 4.12 kHz just happened |
+
+**Watson does not say whether the air conditioner is on, and does not
+say a command was accepted.** It does not know that a beep acknowledges
+a command or that a compressor starting means a request succeeded. The
+controller sends the commands and keeps the history, so it is the one
+place those facts can be combined. v1's single state could not say "fan
+and compressor both running" and made the compressor hide the fan;
+`fan=true, compressor=true` and `fan=true, compressor=false` are both
+ordinary v2 answers.
+
+```
+features -> median (one shared history)
+              |-> fan detector        -> hold timer -> fan_detected
+              '-> compressor detector -> hold timer -> compressor_detected
+raw windows -> beep detector (state machine)         -> BeepEvent
+```
+
+Each detector is a module of its own under `classifier/detectors/`
+(`fan.py`, `compressor.py`, `beep.py`). They are written once on numpy
+booleans, so the live service (scalars) and the threshold search
+(arrays) run the same code. Fan and compressor share the median history
+but not a hold timer, so neither can delay or cancel the other.
+`AcousticObservations.legacy_state()` can still fold the two booleans
+into OFF / FAN / COMPRESSOR; it exists for the history chart and for
+comparison with v1, and is not a v2 output.
+
+**Fan.** Energy in 500-1k and 1k-2k is not enough: speech, a printer or
+a television put power there too. What a fan does that they do not is
+hold still, so the fan also needs `1k-2k_std <= fanStabilityThreshold`
+(the standard deviation of that band over the last two seconds), with at
+least `fanStabilityMinSeconds` of history behind it. This is not
+`holdSeconds`: the hold stops a short-lived candidate being *published*;
+stationarity says what the signal *is*.
+
+**Compressor.** 30-80 Hz at or above `compressorThreshold`. Nothing
+about the fan enters.
+
+**Beep.** The unit's tone is a pure tone near 4.12 kHz lasting about
+150 ms. The detector measures, per analysis window, the power in
+4050-4180 Hz against its neighbours (3850-4000 and 4230-4380 Hz), as
+*contrast* in dB, and runs a small state machine on that:
+
+* a run starts and continues while contrast stays above the **edge**
+  value (10 dB, generous) and the peak sits in the frequency window;
+* when it ends it is accepted only if its best contrast reached the
+  **peak** value (15 dB), it lasted 60-300 ms, its pitch did not wander
+  more than 50 Hz, and it is at least -80 dBFS;
+* one gap window is tolerated, and an 80 ms refractory time stops the
+  decaying tail from becoming a second event;
+* duration is measured centre to centre of the first and last window,
+  because a window that overlaps the tone at all would otherwise add up
+  to a window length (150 ms reads 192 ms; a 30 ms blip reads 64 ms and
+  would pass a 60 ms minimum).
+
+Rejections are counted by reason (`weak`, `too_short`, `too_long`,
+`unstable_pitch`) so a missed beep can be explained. Contrast, not
+absolute level, is what separates a beep from a loud room.
+
+**What the recorded beeps say** (`check_beeps.py`, `evaluate_events.py`):
+19 beeps in 65 minutes of event audio, and none in 14.5 minutes of
+audio with no commands in it. Every real beep had contrast of at least
+15.8 dB and lasted at least 64 ms; the look-alikes were single 32 ms
+windows at 12-13.5 dB, and one loud wandering ring, which is why the
+pitch-spread check exists. **The margin is thin: about 2 dB between the
+weakest real beep and the strongest look-alike.** The thresholds were
+set from 19 beeps in one room; treat them as provisional and re-run
+`check_beeps.py` on the first collected data.
+
+Beeps in the old reviewed events, by what the reviewer said happened
+(beeps seen in the OFF-to-COMPRESSOR and COMPRESSOR-to-OFF events lead
+the published change by about 2.5 s, which is the 2 s hold plus half a
+second):
+
+| reviewed as | events | with a beep |
+| --- | --- | --- |
+| OFF → COMPRESSOR | 5 | 4 |
+| COMPRESSOR → OFF | 4 | 2 |
+| OFF → FAN | 2 | 2 |
+| FAN → OFF | 2 | 1 |
+| FAN → COMPRESSOR | 27 | 1 |
+| OFF → OFF | 21 | 2 |
+| COMPRESSOR → FAN | 21 | 0 |
+
+Most of those recordings were made without marking when a command was
+sent, so this is a count of beeps near transitions, not a measure of how
+often a command beeps. The `commandContext` marker below exists to make
+that measurable.
 
 ### Where things are stored
 
@@ -352,128 +434,162 @@ folder, and the two never share one:
 
 The v1 events are the labelled evidence v2 is judged against; a v2 run
 that added its own to that folder would change the baseline it is being
-compared with, and nothing would show it. So `AppConfig` refuses the
-mix (v2 pointed at a v1 path, or v1 at a v2 path) instead of trusting
-everyone to remember. Switching version is a restart, never a setting,
+compared with. So `AppConfig` refuses the mix (v2 pointed at a v1 path,
+or v1 at a v2 path). Switching version is a restart, never a setting,
 and a saved settings file is never reinterpreted across versions — one
-with no version key predates versions and is v1.
+with no version key predates versions and is v1. The v1 events are
+never modified, migrated or renamed.
 
-The v1 events are never modified, migrated or renamed. A v2 backend
-starts with an empty event list; run `--classifier v1` to browse the old
-ones. **With Docker Compose the default is now v2**, so the container
-writes to `results/v2/`; add `--classifier`, `v1` to its `command` to
-keep growing the v1 dataset.
+The backend's `--classifier` defaults to **v2**, so with Docker Compose
+the container writes to `results/v2/`; add `--classifier`, `v1` to its
+`command` to keep growing the v1 dataset. `classify_live.py` stays v1.
 
-`classify_live.py --classifier v1|v2` selects the same rules for the
-command-line tool (default v1, which is what it always did).
+### v2 events
+
+An event is written when a published observation changes or a beep is
+found: 15 s before and 15 s after, raw PCM, with the decision that
+caused it.
+
+| `eventType` | file suffix | written when |
+| --- | --- | --- |
+| `fan` | `FAN_ON`, `FAN_OFF` | `fan_detected` changed |
+| `compressor` | `COMPRESSOR_ON`, `COMPRESSOR_OFF` | `compressor_detected` changed |
+| `beep` | `BEEP` | a beep was found |
+| `manual` | `MANUAL` | "Record event now" |
+
+Fan and compressor changes are independent: a compressor starting is a
+`COMPRESSOR_ON` event and says nothing about the fan. The first value
+published after a start or an audio gap is a baseline, not a change.
+Every event has `observations` (both values at that moment), the
+config in force, and a `beep` object (duration, pitch, contrast, level)
+for beeps.
+
+**Review.** v1 reviews said what the combined state really was before
+and after. A v2 review is about one observation:
+
+| event | fields |
+| --- | --- |
+| `fan`, `compressor` | `correct`; `actualValue` (required when wrong, what it really was afterwards) |
+| `beep` | `correct` (`actualBeep` is derived: wrong means it was not a beep) |
+| any | `interference`, `notes` |
+
+Contradictions (`correct: true` with a different `actualValue`) are
+refused. The same endpoints accept both shapes, chosen by the event.
+
+**Command markers.** `POST /api/commands` `{command, expectedBeep,
+note}` notes that a command was just sent (the UI has a "Command marker"
+card). An event within 10 s of one carries it as `commandContext`
+(`command`, `sentAt`, `expectedBeep`, `secondsFromEvent`), and
+`PATCH`/`DELETE /api/events/{id}/command-context` set or remove it by
+hand. It is data about the world and nothing reads it back: it does not
+change what is detected.
 
 ### v2 settings
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
+| `compressorThreshold` | `-38` dB | 30-80 Hz level that counts as a compressor |
+| `fanMidThreshold`, `fanHighThreshold`, `fanRequire` | `-62`, `-65`, `both` | fan energy |
 | `fanStabilityFeature` | `1k-2k_std` | which temporal feature must stay small |
 | `fanStabilityThreshold` | `6.0` dB | largest value still read as a steady fan |
 | `fanStabilityMinSeconds` | `1.0` | history needed before the gate trusts it |
-
-Every event records `classifierVersion` and the exact config in force.
-Events from before versions existed carry neither and count as v1.
-The live panel shows the fan-stability value against its limit (green
-when steady), and an event's detail page shows the stationarity
-features at the transition.
+| `beepMinContrastDb` / `beepEdgeContrastDb` | `15` / `10` | peak and edge contrast |
+| `beepMinMs` / `beepMaxMs` | `60` / `300` | accepted duration |
+| `beepMinHz` / `beepMaxHz` | `4050` / `4180` | accepted pitch |
+| `beepMaxPeakSpreadHz` | `50` | how far the pitch may wander |
+| `beepMinLevelDb` | `-80` | quietest accepted tone |
 
 ### Evaluating against reviewed events
 
 ```
 python tools/audio/evaluate_events.py tools/audio/results/events
-python tools/audio/evaluate_events.py tools/audio/results/events --classifier v2
+python tools/audio/check_beeps.py tools/audio/results/events
 ```
 
-Replays each reviewed event's WAV through the same extractor, rule and
-Smoother the backend uses, and scores the published state against what
-the reviewer said was happening. **Ground truth is
-`review.actualFrom` / `review.actualTo` and nothing else** — the
-classifier's own `from` / `to` are what is being tested. Unreviewed and
-`UNKNOWN` events are counted in the summary but never scored. The input
-can be events from either version; output always goes to
-`results/v2/evaluation/`.
+Replays each reviewed event's WAV through the same extractor and
+detectors the backend uses and scores each observation separately.
+**Ground truth is `review.actualFrom` / `review.actualTo` and nothing
+else.** Unreviewed and `UNKNOWN` events are counted but never scored.
+Output goes to `results/v2/evaluation/`.
+
+**Temporary compatibility truth.** The old labels name one state, so to
+score two yes/no questions with them the evaluator assumes the
+compressor only runs while the fan turns:
+
+```
+OFF = (fan no, compressor no)   FAN = (fan yes, compressor no)   COMPRESSOR = (fan yes, compressor yes)
+```
+
+It is a bridge so the old reviews stay usable, written into
+`summary.json`, and is not the v2 review schema. It is also why
+"COMPRESSOR" windows now count against the fan detector when the fan is
+not detected, which the old scoring (the compressor shadowed the fan)
+never exposed. Once v2 reviews exist, score those instead.
 
 A window is scored only where its label can be trusted: the first 5 s
-(replay starts cold) and 4 s either side of a real transition (the
-audio changed somewhere inside it) are skipped. Windows in one event
-are near-copies and neighbouring events overlap in time, so anything
-chosen from the data is validated **by group** — events within 120 s of
-each other — never by window.
+and 4 s either side of a real transition are skipped. Anything chosen
+from the data is validated **by group** — events within 120 s of each
+other — never by window.
 
 | File | What it holds |
 | --- | --- |
-| `summary.json` | parameters, dataset counts, headline metrics, search result |
-| `confusion_v1.csv`, `confusion_v2.csv` | window-level confusion matrices |
-| `per_event.csv` | every event, v1 and v2 side by side, with the difference |
-| `per_interference.csv` | recall per truth class per interference tag |
-| `feature_separation.csv` | which features tell FAN from OFF at all |
+| `summary.json` | parameters, dataset counts, per-observation metrics, search, beeps |
+| `confusion_v1.csv`, `confusion_v2.csv` | window-level 2×3 confusion per observation |
+| `per_event.csv` | every event, v1 and v2 side by side |
+| `per_interference.csv` | correct share per truth value per interference tag |
+| `feature_separation.csv` | which features separate yes from no, per observation |
 | `candidate_thresholds.csv` | every setting the search tried |
 
-The threshold search needs thousands of trials, so it uses a vectorised
-path rather than the Smoother's Python loop. It does not reimplement the
-rule — `classify_v2_codes` is written once and runs on scalars (live) or
-arrays (search) — and the plumbing it does duplicate (rolling median,
-hold) is checked against the real Smoother window for window on every
-run. With the gate disabled v2 reproduces v1 exactly, which a test pins.
+The search uses a vectorised path rather than the smoother's Python
+loop; it reimplements only the rolling median and the hold, and checks
+them against the real smoother window for window on every run.
 
 ### What the evidence says (88 reviewed events, 2026-10-01)
 
-53,014 scored windows in 63 groups; published state, window level:
+53,014 scored windows in 63 groups; published, window level, v1 as run
+live (compressor -38 dB) against v2 defaults:
 
-| | v1 (as run live) | v2 |
+| | v1 | v2 |
 | --- | --- | --- |
-| OFF called FAN | 2438 | **1160** (-52%) |
-| FAN recall | 100.0% | 98.6% |
-| FAN called OFF | 0 | 188 |
-| COMPRESSOR recall | 95.5% | 95.5% |
-| balanced accuracy | 0.934 | **0.951** |
+| fan: reported but not running | 3010 | **1544** (-49%) |
+| fan: running but not reported | 336 | 1265 |
+| fan recall / specificity | 98.9% / 84.8% | 96.2% / 92.2% |
+| fan balanced accuracy | 0.918 | **0.942** |
+| compressor recall / specificity | 95.5% / 98.3% | 95.5% / 98.3% |
+| compressor balanced accuracy | 0.969 | 0.969 |
 
-**The gate threshold was chosen from the data, and it is far looser than
-the plan's starting guess.** Below about 2 dB FAN recall collapses —
-1.2-1.5 dB loses 20-30% of real fan windows, because a real fan moves
-a little. From about 4 to 6 dB OFF→FAN stays flat at its floor while
-FAN recall climbs to 98.6%, so a tighter gate buys nothing there. Above
-6.1 dB false FAN grows again. The plateau within 0.005 of the best is
-4.9-7.0 dB; 6.0 is its centre. Choosing the threshold from 62 groups
-and testing it on the held-out one gives the same 0.951, so the figure
-is not an artefact of tuning it on the data it is scored on. Going
-tighter than ~5 dB is a trade of real fans for false ones, not a free
-improvement, and is yours to make: `candidate_thresholds.csv` has the
-curve.
+The gate trades real fan windows for false ones: it removes about half
+the false fans and loses about 2.7 points of fan recall. The compressor
+is unchanged because its detector is. Its threshold sits in the middle
+of a -42..-34 dB plateau.
+
+The fan gate threshold came from the data and is far looser than a first
+guess. Below about 2 dB recall collapses (a real fan moves a little);
+the plateau within 0.005 of the best is 3.8-6.4 dB (the search
+recommends 5.1, the shipped value is 6.0 and sits inside it).
+Choosing it from 62 groups and testing on the held-out one gives the
+same 0.942, so the figure is not an artefact of tuning.
 
 Things to know before trusting it:
 
-* **Thresholds belong to an installation, not to the rule.** The code
-  default for v1's compressor threshold is -48 dB, tuned on the first
-  recordings. In the newer sessions the OFF-state 30-80 level has a
-  median of -48.7 dB, so at -48 v1 calls 34% of OFF windows COMPRESSOR
-  (balanced accuracy 0.755); the live system had already been moved to
-  -38 for this reason (91 of the first 125 events were recorded at
-  it), and v2 defaults to that value. The reverse also holds: on the
-  original 29 recordings the compressor sits at about -38 dB itself, so
-  v2 at -38 reads only 43% of the clean compressor files correctly. Re-
-  run the evaluation when the microphone moves.
-* **A stationarity gate costs some FAN-under-noise, and the tighter
-  it is the more.** Speech or television over a running fan raises the
-  fan's band variation, so the gate can read "fan + noise" as
-  not-a-fan. On the original recordings `FAN / talking` is 100% under
-  v1 and 83% under v2 at the shipped 6 dB (it was 3% at the 2 dB I
-  first tried). The reviewed events have too little to measure it
-  properly: about 530 FAN windows with interference, where the printer
-  ones are all kept and the single television event (188 windows) is
-  lost entirely. If the air conditioner must be detected reliably while
-  people talk over it, expect to need a different feature as well.
-* **The residual false FAN is concentrated.** One event (`OFF` all the
-  way through, tagged "other") accounts for 470 of the 1160 remaining
-  OFF→FAN windows, and three events for 69%. That is a steady non-AC
-  sound sitting in both fan bands — worth listening to, and not
-  something a variance test can remove.
-* The labelled set is small (88 events, 15 of them OFF with
-  interference). Differences of a point or two are noise.
+* **Thresholds belong to an installation.** v1's code default of -48 dB
+  for the compressor was tuned on the first recordings; in the newer
+  sessions the OFF level is near -49 dB, so -48 would call a third of
+  OFF windows COMPRESSOR. v2 defaults to -38. Re-run the evaluation
+  when the microphone moves.
+* **A stationarity gate costs FAN-under-noise.** Speech or television
+  over a running fan raises its band variation. In the reviewed events
+  the one television event with a running fan (872 windows) is lost
+  entirely (0%), while printer events keep 95%; the fan with
+  interference cases are too few (about 4,700 windows, three tags) to
+  say more. If the unit must be detected while people talk over it,
+  expect to need another feature.
+* **The residual false fan is concentrated.** Events tagged "other"
+  account for most of what remains (78% correct); that is a steady
+  non-AC sound sitting in both fan bands, which a variance test cannot
+  remove.
+* The labelled set is small (88 events, 15 OFF with interference).
+  Differences of a point or two are noise.
 
 ### Do models do better?
 
@@ -482,21 +598,29 @@ python tools/audio/compare_models.py tools/audio/results/events
 ```
 
 Fits logistic regression, shallow decision trees and a small random
-forest on the same reviewed events and scores them next to v1 and v2 —
-same inputs, same publication hold, folds split by group. It is
-analysis only: nothing in the backend imports it or scikit-learn.
-A model has to beat the rule by 0.02 balanced accuracy before it is
-worth discussing, and if a shallow tree comes close, the right move is
-to read its splits and fold them into the rule.
+forest, one binary model per observation, and scores them next to v1
+and the v2 detector — same inputs, same publication hold, folds split by
+group. Analysis only: nothing in the backend imports it or scikit-learn
+(`pip install -r requirements-analysis.txt`). A model has to beat the
+detector by 0.02 balanced accuracy to be worth discussing, and if a
+shallow tree comes close, read its splits and fold them into the
+detector rather than deploying a model. Run it again once v2 data
+exists.
 
-On this data nothing does: the best, a depth-3 tree, scores 0.956
-against the rule's 0.951, and the forest 0.955 with fewer false FANs
-but 2 points worse COMPRESSOR recall. The trees' FAN branch splits on
-`1k-2k_minus_500-1k` (the spectral tilt between the two fan bands)
-rather than on stationarity, and `feature_separation.csv` ranks that
-feature third on its own. It is the obvious next candidate to combine
-with the gate if the remaining false FAN matters — not something to add
-without testing it the same way.
+### Before collecting the v2 dataset
+
+1. Start the backend (default v2). Confirm three cards in the page and
+   that `results/v2/events/` is where files appear.
+2. Press **Mark command sent** when you send a command by remote, with
+   "a beep is expected" set honestly, so beep rate and delay can be
+   measured later.
+3. Review each event as it comes: fan and compressor changes as correct
+   or wrong (say what it really was when wrong), beeps as real or not.
+   Tag interference.
+4. Collect OFF periods with no command at all (the false-beep rate comes
+   from these), and some with the television and talking over a running
+   fan.
+5. Do not retune thresholds mid-collection; evaluate, then change.
 
 ## Backend and web UI
 
@@ -558,7 +682,7 @@ earned again under the new rules.
 
 ### Transition events
 
-A **published** state change writes two files to `results/events/`:
+Under v1, a **published** state change writes two files to `results/events/` (v2 events are described under *v2 events* above and go to `results/v2/events/`):
 
 ```
 2026-09-30_130533_FAN_to_COMPRESSOR.wav     raw evidence
@@ -677,7 +801,7 @@ that point, not the Arduino library that was there before.
 | `capture.py` | serial -> WAV |
 | `visualize.py` | live plots and classifier |
 | `analyze.py` | WAV -> feature tables and plots |
-| `classify_live.py` | serial -> live OFF / FAN / COMPRESSOR (`--classifier v1|v2`) |
+| `classify_live.py` | serial -> live OFF / FAN / COMPRESSOR (v1 only) |
 | `features.py` | the one DSP implementation every other tool imports |
 | `classifier/` | the rules (`v1.py`, `v2.py`) and the shared Smoother (`common.py`) |
 | `evaluation.py`, `evaluate_events.py` | replay reviewed events and score both classifiers |

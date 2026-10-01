@@ -22,7 +22,6 @@ import evaluate_events  # noqa: E402
 import evaluation as ev  # noqa: E402
 import synthetic  # noqa: E402
 from backend.config import ClassifierConfig  # noqa: E402
-from classifier.v2 import ThresholdsV2  # noqa: E402
 
 START = datetime(2026, 10, 1, 12, 0, 0)
 
@@ -249,75 +248,77 @@ class GroupingTests(unittest.TestCase):
         self.assertEqual(len(set(groups.values())), 3)
 
     def test_validation_never_trains_on_the_group_it_tests(self):
-        """Leave-one-group-out picks each threshold without that group.
+        """Leave-one-group-out picks each value without that group.
 
-        Two groups prefer opposite thresholds. If the held-out group
-        leaked into the choice, each would pick its own favourite; it
-        must pick the *other* group's instead.
+        Two groups prefer opposite values. If the held-out group leaked
+        into the choice, each would pick its own favourite; it must pick
+        the *other* group's instead.
         """
-        # per-event confusions, shape (3 classes, 4): only recall on FAN
-        # differs. Threshold A suits group 0, threshold B suits group 1.
-        def matrix(fan_right, fan_wrong):
-            m = np.zeros((3, 4), dtype=np.int64)
-            m[0, 0] = 100                      # OFF always right
-            m[2, 2] = 100                      # COMPRESSOR always right
-            m[1, 1], m[1, 0] = fan_right, fan_wrong
+        def matrix(right, wrong):
+            # truth yes: ``right`` called yes, ``wrong`` called no;
+            # truth no: always right.
+            m = np.zeros((2, 3), dtype=np.int64)
+            m[0, 0] = 100
+            m[1, 1], m[1, 0] = right, wrong
             return m
 
-        sweep = [
-            {"stability_threshold": 1.0, "compressor": -38.0,
-             "fan_mid": -62.0, "fan_high": -65.0},
-            {"stability_threshold": 2.0, "compressor": -38.0,
-             "fan_mid": -62.0, "fan_high": -65.0},
-        ]
-        per_event = {
-            ("stability", "1k-2k_std", 1.0, -38.0, -62.0, -65.0):
-                np.stack([matrix(100, 0), matrix(0, 100)]),
-            ("stability", "1k-2k_std", 2.0, -38.0, -62.0, -65.0):
-                np.stack([matrix(0, 100), matrix(100, 0)]),
-        }
-        search = SimpleNamespace(
-            groups=np.array([0, 1]), per_event=per_event,
-        )
+        # value A suits group 0, value B suits group 1
+        stack = np.stack([
+            np.stack([matrix(100, 0), matrix(0, 100)]),
+            np.stack([matrix(0, 100), matrix(100, 0)]),
+        ])
 
         result = evaluate_events.leave_one_group_out(
-            search, sweep, "1k-2k_std"
+            stack, np.array([0, 1]), [1.0, 2.0]
         )
 
-        # Group 0 held out -> trained on group 1 -> picks 2.0, which is
-        # wrong for group 0. Likewise the other way. Every held-out FAN
-        # window is therefore wrong: the estimate is honestly bad, not
-        # flattered by seeing its own answer.
-        self.assertEqual(result["recall"]["FAN"], 0.0)
+        # Group 0 held out -> chosen on group 1 -> picks 2.0, wrong for
+        # group 0; likewise the other way. Every held-out "yes" window is
+        # wrong: the estimate is honestly bad, not flattered.
+        self.assertEqual(result["recall"], 0.0)
         self.assertEqual(result["groups"], 2)
-        self.assertEqual(result["thresholdsChosen"]["min"], 1.0)
-        self.assertEqual(result["thresholdsChosen"]["max"], 2.0)
+        self.assertEqual(result["valuesChosen"]["min"], 1.0)
+        self.assertEqual(result["valuesChosen"]["max"], 2.0)
 
 
 class ScoringTests(unittest.TestCase):
     def test_confusion_and_metrics(self):
-        truth = np.array([0, 0, 0, 0, 1, 1, 2, 2, -1], dtype=np.int8)
-        predicted = np.array([0, 0, 1, 2, 1, 0, 2, -1, 1], dtype=np.int8)
+        # truth: no no no no yes yes yes -1(unscored)
+        truth = np.array([0, 0, 0, 0, 1, 1, 1, -1], dtype=np.int8)
+        # said:  no no yes none yes no none yes
+        predicted = np.array([0, 0, 1, -1, 1, 0, -1, 1], dtype=np.int8)
 
         matrix = ev.confusion(truth, predicted)
 
         self.assertEqual(matrix.tolist(), [
-            [2, 1, 1, 0],
-            [1, 1, 0, 0],
-            [0, 0, 1, 1],
+            [2, 1, 1],
+            [1, 1, 1],
         ])
-        self.assertEqual(int(matrix.sum()), 8)       # the -1 is unscored
+        self.assertEqual(int(matrix.sum()), 7)       # the -1 is unscored
 
         result = ev.metrics(matrix)
-        self.assertEqual(result["offToFan"], 1)
-        self.assertEqual(result["offToCompressor"], 1)
-        self.assertEqual(result["fanToOff"], 1)
-        self.assertEqual(result["compressorMisses"], 1)
-        self.assertEqual(result["unpublished"], 1)
-        self.assertAlmostEqual(result["recall"]["OFF"], 0.5)
+        self.assertEqual(result["falsePositive"], 1)
+        self.assertEqual(result["falseNegative"], 1)
+        self.assertEqual(result["unpublished"], 2)
+        self.assertAlmostEqual(result["recall"], 1 / 3)
+        self.assertAlmostEqual(result["specificity"], 2 / 4)
+        self.assertAlmostEqual(result["precision"], 1 / 2)
         self.assertAlmostEqual(
-            result["balancedAccuracy"], (0.5 + 0.5 + 0.5) / 3
+            result["balancedAccuracy"], (1 / 3 + 1 / 2) / 2
         )
+
+    def test_compatibility_truth_is_the_documented_mapping(self):
+        old = np.array([0, 1, 2, -1], dtype=np.int8)
+        seen = ev.observation_truth(old)
+
+        self.assertEqual(seen["fan"].tolist(), [0, 1, 1, -1])
+        self.assertEqual(seen["compressor"].tolist(), [0, 0, 1, -1])
+
+        # v1's published state is folded the same way; "nothing yet"
+        # stays nothing-yet.
+        folded = ev.legacy_observations(old)
+        self.assertEqual(folded["fan"].tolist(), [0, 1, 1, -1])
+        self.assertEqual(folded["compressor"].tolist(), [0, 0, 1, -1])
 
     def test_hold_publishes_after_the_candidate_has_persisted(self):
         # 10 windows/s and a 1 s hold: a candidate is published on its
@@ -380,13 +381,26 @@ class FixtureReplayTests(unittest.TestCase):
         cls.temporary.cleanup()
 
     def replay(self, config, name):
+        """(candidate, published) per observation, scored windows only."""
         event = self.by_fixture[name]
-        candidate, state = ev.replay_exact(
-            event.windows, config.rule(), config.median_seconds,
-            config.hold_seconds,
-        )
+
+        if config.version == "v1":
+            run = ev.run_v1(
+                "v1", [event], config.rule(), config.median_seconds,
+                config.hold_seconds,
+            )
+        else:
+            run = ev.run_v2(
+                "v2", [event], config.rule(), config.median_seconds,
+                config.hold_seconds,
+            )
+
         scored = event.truth != ev.UNSCORED
-        return candidate[scored], state[scored]
+
+        return (
+            {o: run.candidate[o][0][scored] for o in ev.OBSERVATIONS},
+            {o: run.published[o][0][scored] for o in ev.OBSERVATIONS},
+        )
 
     def test_every_fixture_is_scored(self):
         self.assertEqual(len(self.events), len(synthetic.FIXTURES))
@@ -394,67 +408,78 @@ class FixtureReplayTests(unittest.TestCase):
         for event in self.events:
             self.assertGreater(event.scored, 400)
 
-    def test_clean_scenarios_end_in_the_right_state_under_both(self):
-        for name in ("off_clean", "fan_clean", "compressor"):
-            expected = ev.LABEL_CODE[synthetic.EXPECTED[name]]
+    def test_clean_scenarios_publish_the_right_observations_under_both(self):
+        expected = {
+            "off_clean": (0, 0), "fan_clean": (1, 0), "compressor": (1, 1),
+        }
 
+        for name, (fan, compressor) in expected.items():
             for config in (self.v1, self.v2):
-                _, state = self.replay(config, name)
+                _, published = self.replay(config, name)
 
                 self.assertTrue(
-                    (state == expected).all(),
-                    f"{name} under {config.version}: "
-                    f"{np.unique(state, return_counts=True)}",
+                    (published["fan"] == fan).all()
+                    and (published["compressor"] == compressor).all(),
+                    f"{name} under {config.version}",
                 )
+
+    def test_v2_reports_fan_and_compressor_together_on_the_compressor(self):
+        candidate, _ = self.replay(self.v2, "compressor")
+
+        # Not a single state: both observations are independently true.
+        self.assertGreater((candidate["compressor"] == 1).mean(), 0.95)
+        self.assertGreater((candidate["fan"] == 1).mean(), 0.9)
 
     def test_clean_fan_is_stationary_so_v2_keeps_it(self):
         candidate, _ = self.replay(self.v2, "fan_clean")
 
-        self.assertGreater((candidate == 1).mean(), 0.95)
+        self.assertGreater((candidate["fan"] == 1).mean(), 0.95)
 
     def test_v2_rejects_the_interference_that_makes_v1_flap(self):
         for name in ("off_talking", "off_tv", "off_alarm"):
-            v1_candidate, v1_state = self.replay(self.v1, name)
-            v2_candidate, v2_state = self.replay(self.v2, name)
+            v1_candidate, v1_published = self.replay(self.v1, name)
+            v2_candidate, v2_published = self.replay(self.v2, name)
 
-            # These put real power in both fan bands, so v1 keeps
-            # calling FAN -- on and off, never long enough to publish.
-            self.assertGreater((v1_candidate == 1).mean(), 0.2, name)
-            self.assertLess((v1_state == 1).mean(), 0.5, name)
+            self.assertGreater((v1_candidate["fan"] == 1).mean(), 0.2, name)
+            self.assertLess((v1_published["fan"] == 1).mean(), 0.5, name)
 
-            # v2 sees that none of it is steady.
-            self.assertLess((v2_candidate == 1).mean(), 0.03, name)
-            self.assertTrue((v2_state == 0).all(), name)
+            self.assertLess((v2_candidate["fan"] == 1).mean(), 0.03, name)
+            self.assertTrue((v2_published["fan"] == 0).all(), name)
 
     def test_impulsive_noise_is_not_a_fan_to_either(self):
         for config in (self.v1, self.v2):
-            candidate, state = self.replay(config, "off_impulsive")
+            candidate, published = self.replay(config, "off_impulsive")
 
-            self.assertLess((candidate == 1).mean(), 0.02)
-            self.assertTrue((state == 0).all())
+            self.assertLess((candidate["fan"] == 1).mean(), 0.02)
+            self.assertTrue((published["fan"] == 0).all())
 
-    def test_compressor_is_unaffected_by_the_gate(self):
+    def test_compressor_is_unaffected_by_the_fan_gate(self):
         for name in synthetic.FIXTURES:
             v1_candidate, _ = self.replay(self.v1, name)
             v2_candidate, _ = self.replay(self.v2, name)
 
             self.assertEqual(
-                (v1_candidate == 2).tolist(), (v2_candidate == 2).tolist(),
-                name,
+                v1_candidate["compressor"].tolist(),
+                v2_candidate["compressor"].tolist(), name,
             )
 
-    def test_with_the_gate_open_v2_is_v1(self):
+    def test_with_the_gate_open_v2_fan_is_v1s_fan_evidence(self):
         open_gate = ClassifierConfig.for_version("v2").patched({
             "fanStabilityThreshold": 100.0,
             "fanStabilityMinSeconds": 0.0,
             "compressorThreshold": -38.0,
         })
 
-        for name in synthetic.FIXTURES:
-            for left, right in zip(
-                self.replay(self.v1, name), self.replay(open_gate, name)
-            ):
-                self.assertTrue(np.array_equal(left, right), name)
+        for name in ("off_clean", "fan_clean", "off_talking", "off_tv"):
+            v1_candidate, _ = self.replay(self.v1, name)
+            v2_candidate, _ = self.replay(open_gate, name)
+
+            # v1 reports FAN for fan evidence only when there is no
+            # compressor; elsewhere the two views agree.
+            self.assertEqual(
+                v1_candidate["fan"].tolist(), v2_candidate["fan"].tolist(),
+                name,
+            )
 
     def test_fast_path_agrees_with_the_real_smoother(self):
         for hold in (0.0, 1.0, 2.0, 3.5):
@@ -543,17 +568,22 @@ class EvaluateEventsCliTests(unittest.TestCase):
             v1, v2 = (summary["classifiers"][v] for v in ("v1", "v2"))
             self.assertEqual(v1["config"]["classifierVersion"], "v1")
             self.assertEqual(v2["config"]["classifierVersion"], "v2")
+            self.assertIn(
+                "COMPRESSOR=(yes,yes)",
+                summary["parameters"]["truthAssumption"],
+            )
 
-            # v2 should not be worse than v1 on this set, and it must
-            # remove the interference-driven FAN candidates.
+            # Each observation is scored on its own.
+            self.assertEqual(set(v2["published"]), {"fan", "compressor"})
+
+            fan1, fan2 = v1["published"]["fan"], v2["published"]["fan"]
             self.assertGreaterEqual(
-                v2["published"]["balancedAccuracy"],
-                v1["published"]["balancedAccuracy"],
+                fan2["balancedAccuracy"], fan1["balancedAccuracy"]
             )
             self.assertLessEqual(
-                v2["published"]["offToFan"], v1["published"]["offToFan"]
+                fan2["falsePositive"], fan1["falsePositive"]
             )
-            self.assertEqual(v2["published"]["offToFan"], 0)
+            self.assertEqual(fan2["falsePositive"], 0)
 
             self.assertGreater(summary["search"]["settingsTried"], 100)
             self.assertGreaterEqual(
@@ -569,6 +599,8 @@ class EvaluateEventsCliTests(unittest.TestCase):
                 {row["actual_to"] for row in rows},
                 {"OFF", "FAN", "COMPRESSOR"},
             )
+            self.assertIn("v2_fan_false_yes", rows[0])
+            self.assertIn("v2_compressor_false_no", rows[0])
 
             # The input events were only ever read.
             self.assertEqual(
