@@ -166,6 +166,22 @@ class CommandContextTests(unittest.TestCase):
         self.assertLess(abs(context["secondsFromEvent"]), 5)
         self.assertEqual(context["note"], "from remote")
 
+    def test_a_command_that_arrives_late_is_attached_to_the_saved_event(self):
+        event = self.beep_event()
+        self.assertNotIn("commandContext", event)
+
+        marker = self.history.record_command("POWER", True, 9.0, delay=2.0)
+        attached = self.recorder.attach_late_command(marker)
+
+        self.assertEqual(attached, [event["id"]])
+        context = self.recorder.get(event["id"])["commandContext"]
+        self.assertEqual(context["command"], "POWER")
+        # Dated at the estimated send time, not the arrival time.
+        self.assertLess(marker["time"], time.time() - 1.5)
+        # An event that already has one is left alone.
+        again = self.history.record_command("OTHER", True, 9.5)
+        self.assertEqual(self.recorder.attach_late_command(again), [])
+
     def test_no_command_means_no_context_not_an_empty_one(self):
         self.assertNotIn("commandContext", self.beep_event())
 
@@ -218,16 +234,14 @@ class ReviewSchemaTests(unittest.TestCase):
         fields = review_for_event(meta("fan", to=False), {"correct": True})
         self.assertEqual(fields["actualValue"], False)
 
-    def test_wrong_needs_to_say_what_it_really_was(self):
-        with self.assertRaises(ValueError):
-            review_for_event(meta("compressor", to=True), {"correct": False})
-
-        fields = review_for_event(
-            meta("compressor", to=True),
-            {"correct": False, "actualValue": False},
-        )
-        self.assertEqual(fields["actualValue"], False)
-        self.assertEqual(fields["correct"], False)
+    def test_wrong_means_the_opposite_value(self):
+        # Binary: FAN_ON wrong = the fan was off; COMPRESSOR_OFF wrong = on.
+        for event_type, to in (("fan", True), ("fan", False),
+                               ("compressor", True)):
+            fields = review_for_event(meta(event_type, to=to),
+                                      {"correct": False})
+            self.assertEqual(fields["actualValue"], not to)
+            self.assertFalse(fields["correct"])
 
     def test_contradictions_are_refused(self):
         with self.assertRaises(ValueError):
@@ -280,6 +294,93 @@ class ReviewSchemaTests(unittest.TestCase):
         self.assertEqual(fields["notes"], "tv on")
 
 
+class OutcomeReviewTests(unittest.TestCase):
+    """Three outcomes for a reported boolean transition X -> Y."""
+
+    def event(self, origin, target, kind="fan"):
+        return {**meta(kind, to=target), "from": origin}
+
+    def test_correct_is_the_reported_transition(self):
+        f = review_for_event(self.event(False, True), {"outcome": "correct"})
+        self.assertEqual((f["actualFrom"], f["actualTo"]), (False, True))
+        self.assertTrue(f["correct"])
+
+    def test_no_transition_stayed_true_or_false(self):
+        # OFF -> ON that really stayed ON, or stayed OFF.
+        for outcome, value in (("stayed_true", True), ("stayed_false", False)):
+            f = review_for_event(self.event(False, True), {"outcome": outcome})
+            self.assertEqual((f["actualFrom"], f["actualTo"]), (value, value))
+            self.assertEqual(f["actualValue"], value)
+            self.assertFalse(f["correct"])
+
+        # ON -> OFF likewise.
+        f = review_for_event(self.event(True, False), {"outcome": "stayed_true"})
+        self.assertEqual((f["actualFrom"], f["actualTo"]), (True, True))
+
+    def test_the_old_binary_form_maps_onto_outcomes(self):
+        f = review_for_event(self.event(False, True), {"correct": False})
+        self.assertEqual(f["outcome"], "stayed_false")
+        f = review_for_event(self.event(True, False), {"correct": False})
+        self.assertEqual(f["outcome"], "stayed_true")
+        f = review_for_event(self.event(True, False), {"correct": True})
+        self.assertEqual(f["outcome"], "correct")
+
+    def test_contradictions_and_missing_verdicts_are_refused(self):
+        ev = self.event(False, True)
+        for body in ({}, {"outcome": "correct", "correct": False},
+                     {"outcome": "stayed_true", "correct": True},
+                     {"outcome": "stayed_true", "actualValue": False}):
+            with self.assertRaises(ValueError, msg=body):
+                review_for_event(ev, body)
+
+    def test_a_beep_has_no_transition_outcomes(self):
+        with self.assertRaises(ValueError):
+            review_for_event(meta("beep"), {"outcome": "stayed_true"})
+
+    def test_bulk_outcomes(self):
+        request = EventBulkReviewRequest(ids=["a"], outcome="stayed_false")
+        self.assertFalse(request.verdict)
+        f = _bulk_review_fields(self.event(False, True), request)
+        self.assertEqual(f["outcome"], "stayed_false")
+
+        with self.assertRaises(ValueError):
+            _bulk_review_fields(meta("beep"), request)
+
+        ok = EventBulkReviewRequest(ids=["a"], outcome="correct")
+        self.assertTrue(_bulk_review_fields(meta("beep"), ok)["actualBeep"])
+        with self.assertRaises(ValidationError):
+            EventBulkReviewRequest(ids=["a"], outcome="correct", correct=True)
+
+
+class ManualReviewTests(unittest.TestCase):
+    def manual(self, fan, compressor):
+        return {**meta("manual"),
+                "observations": {"fan": fan, "compressor": compressor}}
+
+    def test_a_manual_review_says_what_was_happening(self):
+        fields = review_for_event(self.manual(True, False), {
+            "actualFan": True, "actualCompressor": False, "actualBeep": True,
+        })
+        self.assertEqual(fields["actualBeep"], True)
+        self.assertTrue(fields["correct"])        # detectors agreed
+
+        fields = review_for_event(self.manual(True, False), {
+            "actualFan": True, "actualCompressor": True, "actualBeep": False,
+        })
+        self.assertFalse(fields["correct"])       # compressor was missed
+
+    def test_all_three_answers_are_needed(self):
+        with self.assertRaises(ValueError):
+            review_for_event(self.manual(True, True), {"actualFan": True})
+
+    def test_the_fields_belong_to_manual_events_only(self):
+        with self.assertRaises(ValueError):
+            review_for_event(meta("fan", to=True),
+                             {"correct": True, "actualFan": True})
+        with self.assertRaises(ValueError):
+            review_for_event(meta("beep"), {"actualBeep": True})
+
+
 class BulkReviewTests(unittest.TestCase):
     def test_exactly_one_schema_per_request(self):
         with self.assertRaises(ValidationError):
@@ -307,21 +408,17 @@ class BulkReviewTests(unittest.TestCase):
         self.assertEqual(fan["actualValue"], True)
         self.assertEqual(beep["actualBeep"], True)
 
-    def test_a_wrong_verdict_for_every_event_needs_per_type_detail(self):
+    def test_a_wrong_verdict_is_derived_per_event(self):
         request = EventBulkReviewRequest(ids=["a"], correct=False)
 
-        with self.assertRaises(ValueError):
-            _bulk_review_fields(meta("fan", to=True), request)
-
-        # A beep that is not a beep needs nothing more.
+        self.assertEqual(
+            _bulk_review_fields(meta("fan", to=True), request)["actualValue"],
+            False)
+        self.assertEqual(
+            _bulk_review_fields(meta("compressor", to=False),
+                                request)["actualValue"], True)
         self.assertFalse(
             _bulk_review_fields(meta("beep"), request)["actualBeep"])
-
-        said = EventBulkReviewRequest(
-            ids=["a"], correct=False, actualValue=False)
-        self.assertEqual(
-            _bulk_review_fields(meta("fan", to=True), said)["actualValue"],
-            False)
 
 
 class MarkerAndStorageTests(unittest.TestCase):

@@ -12,10 +12,62 @@ sys.path.insert(0, str(TOOLS))
 from backend.app import create_app, load_saved_config  # noqa: E402
 from backend.config import (  # noqa: E402
     AppConfig,
+    load_saved_target,
     load_runtime_config,
     write_runtime_config,
 )
-from backend.models import ConfigPatch  # noqa: E402
+from backend.models import ConfigPatch, TargetPatch  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
+
+
+class StreamTargetTests(unittest.TestCase):
+    def _app(self, root, **overrides):
+        settings = AppConfig(
+            config_path=root / "config.json",
+            history_path=root / "history.db",
+            events_dir=root / "events",
+            **overrides,
+        )
+        return settings, create_app(settings)
+
+    def test_put_changes_target_persists_and_retargets_service(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings, app = self._app(root, target="10.0.0.1:3333")
+            endpoint = next(
+                route.endpoint for route in app.routes
+                if getattr(route, "path", None) == "/api/stream/target"
+                and "PUT" in getattr(route, "methods", set())
+            )
+            result = asyncio.run(endpoint(TargetPatch(target=" 10.0.0.9:4444 ")))
+            saved = json.loads(settings.target_path.read_text("utf-8"))
+            retargeted = app.state.service._retarget.is_set()
+            app.state.service.close()
+
+        self.assertEqual(result, {"target": "10.0.0.9:4444"})
+        self.assertEqual(settings.target, "10.0.0.9:4444")
+        self.assertEqual(saved["launchTarget"], "10.0.0.1:3333")
+        self.assertTrue(retargeted)
+
+    def test_invalid_addresses_are_rejected(self):
+        for bad in ("COM3", "", "host name:1", "10.0.0.1:0", "10.0.0.1:70000"):
+            with self.subTest(bad=bad), self.assertRaises(ValidationError):
+                TargetPatch(target=bad)
+
+    def test_saved_target_applies_only_to_the_launch_it_was_made_for(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "target.json"
+            write_runtime_config(
+                path, {"target": "10.0.0.9:4444", "launchTarget": "a:1"}
+            )
+            same = load_saved_target(path, "a:1")
+            # AUDIO_TARGET was edited since: the new value wins.
+            changed = load_saved_target(path, "b:2")
+            missing = load_saved_target(Path(directory) / "none.json", "a:1")
+
+        self.assertEqual(same, "10.0.0.9:4444")
+        self.assertIsNone(changed)
+        self.assertIsNone(missing)
 
 
 class PersistedConfigTests(unittest.TestCase):

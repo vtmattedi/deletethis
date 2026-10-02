@@ -58,19 +58,6 @@ const V2_SETTINGS = [
 let activeSettings = SETTINGS;
 
 const $ = (id) => document.getElementById(id);
-
-// "Really on / really off" for a v2 fan or compressor review.
-function valueSelect(value) {
-  const select = document.createElement("select");
-  for (const [text, key] of [["Select…", ""], ["on", "on"], ["off", "off"]]) {
-    const option = document.createElement("option");
-    option.value = key;
-    option.textContent = text;
-    select.append(option);
-  }
-  select.value = value === true ? "on" : value === false ? "off" : "";
-  return select;
-}
 const DEFAULT_PLAYBACK_GAIN_DB = 6;
 
 let lastEventCount = -1;
@@ -416,6 +403,77 @@ function applyConfig(config) {
 
 $("saveSettings").addEventListener("click", saveSettings);
 
+// The TCP address the backend reads audio from. Separate from the
+// classifier settings: it is not part of /api/config and applying it
+// reconnects rather than retuning.
+let targetDirty = false;
+
+function applyTarget(target) {
+  if (targetDirty || !target) return;
+  const input = $("targetInput");
+  if (document.activeElement !== input) input.value = target;
+}
+
+$("targetInput").addEventListener("input", () => {
+  targetDirty = true;
+  $("applyTarget").disabled = !$("targetInput").value.trim();
+  $("targetNote").textContent = "Unsaved address";
+});
+
+async function saveTarget() {
+  const note = $("targetNote");
+  const target = $("targetInput").value.trim();
+  if (!target) return;
+
+  $("applyTarget").disabled = true;
+
+  let response;
+  try {
+    response = await fetch("/api/stream/target", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target }),
+    });
+  } catch (_) {
+    note.textContent = "Could not reach the backend";
+    $("applyTarget").disabled = false;
+    return;
+  }
+
+  if (!response.ok) {
+    // 422 carries pydantic's message for the field.
+    let detail = "";
+    try {
+      const body = await response.json();
+      detail = Array.isArray(body.detail)
+        ? body.detail.map((item) => item.msg.replace(/^Value error, /, "")).join("; ")
+        : String(body.detail || "");
+    } catch (_) {}
+    note.textContent = "Address rejected" + (detail ? ": " + detail : "");
+    $("applyTarget").disabled = false;
+    return;
+  }
+
+  const saved = await response.json();
+  targetDirty = false;
+  $("targetInput").value = saved.target;
+  note.textContent = "Saved — reconnecting to " + saved.target;
+}
+
+$("applyTarget").addEventListener("click", saveTarget);
+$("targetForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  saveTarget();
+});
+
+const settingsDialog = $("settingsDialog");
+$("openSettings").addEventListener("click", () => settingsDialog.showModal());
+$("closeSettings").addEventListener("click", () => settingsDialog.close());
+// A click on the backdrop (the dialog element itself) closes it.
+settingsDialog.addEventListener("click", (event) => {
+  if (event.target === settingsDialog) settingsDialog.close();
+});
+
 function setObservation(id, value) {
   const element = $(id);
   if (value === true) {
@@ -428,6 +486,13 @@ function setObservation(id, value) {
     element.textContent = "waiting…";
     element.className = "obs-value unknown";
   }
+}
+
+function commandAge(epoch) {
+  const age = Math.max(0, Date.now() / 1000 - epoch);
+  return age < 90 ? `${age.toFixed(0)} s ago`
+    : age < 5400 ? `${(age / 60).toFixed(0)} min ago`
+    : new Date(epoch * 1000).toLocaleTimeString();
 }
 
 const yesNo = (value) => value === true ? "yes" : value === false ? "no" : "--";
@@ -453,6 +518,12 @@ function renderClassifier(data) {
   const held = data.stableSeconds || {};
   const evidence = data.fanEvidence || {};
   const features = data.features || {};
+
+  const last = data.lastCommand;
+  $("lastCommand").textContent = last
+    ? `Last command: ${last.command} · ${commandAge(last.time)}` +
+      `${last.note ? ` · ${last.note}` : ""}`
+    : "No command marked yet.";
 
   setObservation("fanValue", seen.fan);
   $("fanCandidate").textContent = yesNo(candidates.fan);
@@ -534,6 +605,7 @@ function render(data) {
   }
 
   if (data.config) applyConfig(data.config);
+  applyTarget(data.target);
 
   const eventStatus = data.events || {};
   const pending = eventStatus.pending || 0;
@@ -587,6 +659,7 @@ async function loadEvents() {
   for (const event of events) {
     const item = document.createElement("li");
     item.className = "event";
+    item.dataset.eventId = event.id;
     item.addEventListener("click", (e) => {
       if (e.target.closest("audio, button, input, label")) return;
       openEvent(event.id, item);
@@ -638,47 +711,76 @@ async function loadEvents() {
       ? "unreviewed"
       : verdict ? "correct" : "incorrect";
     review.className = `review-status review-${correctness}`;
-    review.textContent = correctness;
+    const outcome = event.review?.outcome;
+    review.textContent = outcome === "stayed_true" ? "no transition: true"
+      : outcome === "stayed_false" ? "no transition: false"
+      : correctness;
 
-    const quickCorrect = document.createElement("button");
-    quickCorrect.type = "button";
-    quickCorrect.className = "quick-correct";
-    quickCorrect.textContent = correctness === "correct" ? "Correct ✓" : "Correct";
-    quickCorrect.title = "Mark correct with no interference or notes";
-    quickCorrect.disabled = correctness === "correct";
-    quickCorrect.addEventListener("click", async () => {
-      quickCorrect.disabled = true;
-      quickCorrect.textContent = "Saving…";
-      try {
-        const response = await fetch(`/api/events/${event.id}/review`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(
-            isV2(event)
-              ? { correct: true, interference: [], notes: "" }
-              : {
-                classificationCorrect: true,
-                actualFrom: event.from || "UNKNOWN",
-                actualTo: event.to || "UNKNOWN",
-                interference: [],
-                notes: "",
-              },
-          ),
-        });
-        if (!response.ok) throw new Error("review request failed");
-
-        const updated = await response.json();
-        event.review = updated.review;
-        correctness = "correct";
-        review.className = "review-status review-correct";
-        review.textContent = "correct";
-        quickCorrect.textContent = "Correct ✓";
-        if (item.classList.contains("open")) openEvent(event.id, item);
-      } catch (_) {
-        quickCorrect.disabled = false;
-        quickCorrect.textContent = "Retry correct";
-      }
-    });
+    // Quick review. v1: one "Correct". v2 fan/compressor: the three
+    // outcomes of a reported X -> Y; a beep: cor. Manual: open it.
+    const quick = document.createElement("span");
+    quick.className = "quick-reviews";
+    const observation = isV2(event) &&
+      (event.eventType === "fan" || event.eventType === "compressor");
+    const choices = !isV2(event)
+      ? [["Correct", null, "Mark correct with no interference or notes"]]
+      : observation
+        ? [
+          ["cor", "correct", `Correct: it really went ${event.from} → ${event.to}`],
+          ["ntt", "stayed_true", "No transition: it stayed true"],
+          ["ntf", "stayed_false", "No transition: it stayed false"],
+        ]
+        : event.eventType === "beep"
+          ? [["cor", "correct", "Correct: there really was a beep"]]
+          : [];
+    for (const [label, outcome, title] of choices) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "quick-correct";
+      button.textContent = label;
+      button.title = title;
+      button.classList.toggle(
+        "active",
+        isV2(event) && event.review?.status === "reviewed" &&
+          (event.review.outcome ?? (event.review.correct ? "correct" : null))
+            === outcome,
+      );
+      button.addEventListener("click", async () => {
+        for (const other of quick.querySelectorAll("button")) {
+          other.disabled = true;
+        }
+        const body = !isV2(event)
+          ? {
+            classificationCorrect: true,
+            actualFrom: event.from || "UNKNOWN",
+            actualTo: event.to || "UNKNOWN",
+            interference: [], notes: "",
+          }
+          : observation
+            ? { outcome, interference: [], notes: "" }
+            : { correct: true, interference: [], notes: "" };
+        try {
+          const response = await fetch(`/api/events/${event.id}/review`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          if (!response.ok) throw new Error("review request failed");
+          const reopen = item.classList.contains("open");
+          await loadEvents();
+          const fresh = document.querySelector(
+            `li.event[data-event-id="${event.id}"]`,
+          );
+          if (reopen && fresh) openEvent(event.id, fresh);
+        } catch (_) {
+          button.textContent = "retry";
+          for (const other of quick.querySelectorAll("button")) {
+            other.disabled = false;
+          }
+        }
+      });
+      quick.append(button);
+    }
 
     const held = document.createElement("span");
     held.className = "note";
@@ -693,7 +795,17 @@ async function loadEvents() {
     audio.src = `/api/events/${event.id}/audio`;
     enablePlaybackGain(audio);
 
-    item.append(select, when, what, review, quickCorrect, held, audio);
+    item.append(select, when, what);
+    if (event.commandContext) {
+      const sent = document.createElement("span");
+      sent.className = "event-kind kind-command";
+      const offset = event.commandContext.secondsFromEvent;
+      sent.textContent = `sent ${event.commandContext.command}` +
+        `${offset == null ? "" : ` (${offset > 0 ? "+" : ""}${offset} s)`}`;
+      sent.title = "A command was marked near this event";
+      item.append(sent);
+    }
+    item.append(review, quick, held, audio);
     list.append(item);
   }
 }
@@ -761,10 +873,12 @@ function openBulkReview() {
     return;
   }
   const v2 = v2Count > 0;
-  // A wrong fan/compressor event must say what it really was.
-  const needsValue = known.some(
-    (event) => event.eventType === "fan" || event.eventType === "compressor",
-  );
+  if (known.some((event) => event.eventType === "manual")) {
+    $("bulkActionNote").textContent =
+      "Manual captures are reviewed one at a time: open each and say what " +
+      "was happening.";
+    return;
+  }
 
   const panel = $("bulkReview");
   const body = $("bulkReviewBody");
@@ -784,15 +898,26 @@ function openBulkReview() {
   choices.className = "review-actions";
   const correct = document.createElement("button");
   const wrong = document.createElement("button");
+  const stayedTrue = document.createElement("button");
+  const stayedFalse = document.createElement("button");
   const save = document.createElement("button");
   const message = document.createElement("span");
   correct.type = wrong.type = save.type = "button";
+  stayedTrue.type = stayedFalse.type = "button";
   correct.textContent = "Correct";
-  wrong.textContent = "Wrong";
+  wrong.textContent = v2 ? "Not a beep" : "Wrong";
+  stayedTrue.textContent = "No transition: true";
+  stayedFalse.textContent = "No transition: false";
   save.textContent = "Save reviews";
   correct.className = wrong.className = "review-choice";
+  stayedTrue.className = stayedFalse.className = "review-choice";
   message.className = "note";
-  choices.append(correct, wrong, save, message);
+  choices.append(
+    correct, ...(v2 ? [stayedTrue, stayedFalse] : []), wrong, save, message,
+  );
+  // v2: fan / compressor events take the No transition outcomes, beeps
+  // take Correct or Not a beep. One click applies to the whole selection.
+  let outcome = null;
   form.append(choices);
 
   const stateSelect = () => {
@@ -816,13 +941,11 @@ function openBulkReview() {
     form.append(label);
   };
 
-  // v1: the state before and after. v2: what the observation really was
-  // afterwards (the second select is unused there).
-  const actualFrom = v2 ? valueSelect() : stateSelect();
-  const actualTo = v2 ? valueSelect() : stateSelect();
-  if (v2) {
-    if (needsValue) field("Really, afterwards", actualFrom);
-  } else {
+  // v1 says what the state really was before and after. v2 is binary:
+  // Wrong means the opposite of what the event reported.
+  const actualFrom = stateSelect();
+  const actualTo = stateSelect();
+  if (!v2) {
     field("Actual from", actualFrom);
     field("Actual to", actualTo);
   }
@@ -848,6 +971,8 @@ function openBulkReview() {
   const showVerdict = () => {
     correct.classList.toggle("active", verdict === true);
     wrong.classList.toggle("active", verdict === false);
+    stayedTrue.classList.toggle("active", outcome === "stayed_true");
+    stayedFalse.classList.toggle("active", outcome === "stayed_false");
     actualFrom.disabled = verdict === true;
     actualTo.disabled = verdict === true;
     if (verdict === true) {
@@ -855,8 +980,21 @@ function openBulkReview() {
       actualTo.value = "";
     }
   };
+  stayedTrue.addEventListener("click", () => {
+    verdict = false;
+    outcome = "stayed_true";
+    showVerdict();
+    message.textContent = "Beeps in the selection cannot take this.";
+  });
+  stayedFalse.addEventListener("click", () => {
+    verdict = false;
+    outcome = "stayed_false";
+    showVerdict();
+    message.textContent = "Beeps in the selection cannot take this.";
+  });
   correct.addEventListener("click", () => {
     verdict = true;
+    outcome = null;
     showVerdict();
     message.textContent = v2
       ? "Each event will be confirmed as the detector saw it."
@@ -864,6 +1002,7 @@ function openBulkReview() {
   });
   wrong.addEventListener("click", () => {
     verdict = false;
+    outcome = null;
     showVerdict();
     message.textContent = "";
   });
@@ -872,10 +1011,6 @@ function openBulkReview() {
   save.addEventListener("click", async () => {
     if (verdict === null) {
       message.textContent = "Choose Correct or Wrong.";
-      return;
-    }
-    if (verdict === false && v2 && needsValue && !actualFrom.value) {
-      message.textContent = "Say what it really was, afterwards.";
       return;
     }
     if (verdict === false && !v2 && (!actualFrom.value || !actualTo.value)) {
@@ -890,10 +1025,8 @@ function openBulkReview() {
       notes: notes.value,
     };
     if (v2) {
-      payload.correct = verdict;
-      if (verdict === false && needsValue) {
-        payload.actualValue = actualFrom.value === "on";
-      }
+      if (outcome) payload.outcome = outcome;
+      else payload.correct = verdict;
     } else {
       payload.classificationCorrect = verdict;
       if (verdict === false) {
@@ -1104,6 +1237,23 @@ async function loadHistory() {
     }
   }
 
+  const commandMarks = (data.commands || []).map(
+    (cmd) => ({ t: cmd.time, colour: "#d6a8f0" }),
+  );
+  if (commandMarks.length) {
+    legend($("historyLegend"), ["rms", ...BANDS]);
+    const key = document.createElement("span");
+    key.className = "key";
+    key.innerHTML = '<i style="background:#d6a8f0"></i>command sent';
+    $("historyLegend").append(key);
+    if (hasV2) {
+      const beepKey = document.createElement("span");
+      beepKey.className = "key";
+      beepKey.innerHTML = '<i style="background:#e0c341"></i>beep';
+      $("historyLegend").append(beepKey);
+    }
+  }
+
   lineChart(
     $("historyChart"),
     c.t || [],
@@ -1119,9 +1269,9 @@ async function loadHistory() {
             { name: "fan", values: c.fan_detected.map(asBool), colour: "#1f9d55" },
             { name: "comp", values: c.compressor_detected.map(asBool), colour: "#d2691e" },
           ],
-          marks: beepMarks,
+          marks: [...beepMarks, ...commandMarks],
         }
-        : { states: c.state || [] }),
+        : { states: c.state || [], marks: commandMarks }),
       outages,
       xFormat: (v) => new Date(v * 1000).toLocaleTimeString(),
       emptyText: "no history recorded in this range yet",
@@ -1160,7 +1310,107 @@ function closeEventDetail() {
   }
 }
 
+// Manual captures claim nothing, so the review says what was happening.
+function buildReviewManual(meta) {
+  const form = document.createElement("div");
+  form.className = "review-form";
+  form.append(heading("Review"));
+
+  const review = meta.review || {};
+  const seen = meta.observations || {};
+  const choice = (value) => {
+    const select = document.createElement("select");
+    for (const [text, key] of [["Select…", ""], ["yes", "yes"], ["no", "no"]]) {
+      const option = document.createElement("option");
+      option.value = key;
+      option.textContent = text;
+      select.append(option);
+    }
+    select.value = value === true ? "yes" : value === false ? "no" : "";
+    return select;
+  };
+  const field = (label, control) => {
+    const wrapper = document.createElement("label");
+    const name = document.createElement("span");
+    name.textContent = label;
+    wrapper.append(name, control);
+    form.append(wrapper);
+  };
+
+  // Start from what was already said, else from what the detectors saw
+  // (beeps have no such guess).
+  const fan = choice(review.actualFan ?? seen.fan);
+  const compressor = choice(review.actualCompressor ?? seen.compressor);
+  const beep = choice(review.actualBeep);
+  field("Fan running", fan);
+  field("Compressor running", compressor);
+  field("Had a beep", beep);
+
+  const tags = document.createElement("div");
+  tags.className = "review-tags";
+  const selected = new Set(review.interference || []);
+  for (const tag of ["talking", "printer", "tv", "other"]) {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = tag;
+    input.checked = selected.has(tag);
+    const text = document.createElement("span");
+    text.textContent = tag;
+    label.append(input, text);
+    tags.append(label);
+  }
+  field("Interference", tags);
+
+  const notes = document.createElement("textarea");
+  notes.value = review.notes || "";
+  notes.placeholder = "Optional notes";
+  field("Notes", notes);
+
+  const actions = document.createElement("div");
+  actions.className = "review-actions";
+  const save = document.createElement("button");
+  save.type = "button";
+  save.textContent = "Save review";
+  const message = document.createElement("span");
+  message.className = "note";
+  actions.append(save, message);
+  form.append(actions);
+
+  save.addEventListener("click", async () => {
+    if (!fan.value || !compressor.value || !beep.value) {
+      message.textContent = "Answer all three.";
+      return;
+    }
+    save.disabled = true;
+    message.textContent = "Saving…";
+    const response = await fetch(`/api/events/${meta.id}/review`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        actualFan: fan.value === "yes",
+        actualCompressor: compressor.value === "yes",
+        actualBeep: beep.value === "yes",
+        interference: [...tags.querySelectorAll("input:checked")]
+          .map((input) => input.value),
+        notes: notes.value,
+      }),
+    });
+    save.disabled = false;
+    message.textContent = response.ok
+      ? "Review saved." : "Review could not be saved.";
+    if (response.ok) {
+      closeEventDetail();
+      loadEvents();
+    }
+  });
+
+  return form;
+}
+
 function buildReviewV2(meta) {
+  if (meta.eventType === "manual") return buildReviewManual(meta);
+
   const form = document.createElement("div");
   form.className = "review-form";
   form.append(heading("Review"));
@@ -1169,6 +1419,9 @@ function buildReviewV2(meta) {
   let verdict = review.status === "reviewed" ? review.correct : null;
   const observation = meta.eventType === "fan" ||
     meta.eventType === "compressor";
+  // Fan / compressor: what reality did around the reported X -> Y.
+  let outcome = review.status === "reviewed"
+    ? (review.outcome ?? (review.correct ? "correct" : null)) : null;
 
   const choices = document.createElement("div");
   choices.className = "review-actions";
@@ -1182,7 +1435,16 @@ function buildReviewV2(meta) {
   save.textContent = "Save review";
   correct.className = wrong.className = "review-choice";
   message.className = "note";
-  choices.append(correct, wrong, save, message);
+  const stayedTrue = document.createElement("button");
+  const stayedFalse = document.createElement("button");
+  stayedTrue.type = stayedFalse.type = "button";
+  stayedTrue.className = stayedFalse.className = "review-choice";
+  stayedTrue.textContent = "No transition: true";
+  stayedFalse.textContent = "No transition: false";
+  choices.append(
+    correct, ...(observation ? [stayedTrue, stayedFalse] : [wrong]),
+    save, message,
+  );
   form.append(choices);
 
   const field = (label, control) => {
@@ -1192,11 +1454,6 @@ function buildReviewV2(meta) {
     wrapper.append(name, control);
     form.append(wrapper);
   };
-
-  const really = valueSelect(review.actualValue);
-  if (observation) {
-    field(`Was the ${meta.eventType} really on, afterwards?`, really);
-  }
 
   const tags = document.createElement("div");
   tags.className = "review-tags";
@@ -1224,45 +1481,53 @@ function buildReviewV2(meta) {
   hint.textContent = meta.eventType === "beep"
     ? "Correct: there really was a beep. Wrong: there was not."
     : observation
-      ? "Correct: the detector's new value was right. Wrong: say what it " +
-        "really was."
+      ? `Correct: it really went ${meta.from} → ${meta.to}. ` +
+        "No transition: true / false: the observation stayed that value " +
+        "the whole time (so the detector was wrong to report a change). " +
+        "Add detail in the notes if there is more to say."
       : "Correct: the capture is what you wanted.";
   form.append(hint);
 
   const showVerdict = () => {
-    correct.classList.toggle("active", verdict === true);
+    correct.classList.toggle(
+      "active", observation ? outcome === "correct" : verdict === true,
+    );
     wrong.classList.toggle("active", verdict === false);
+    stayedTrue.classList.toggle("active", outcome === "stayed_true");
+    stayedFalse.classList.toggle("active", outcome === "stayed_false");
   };
   correct.addEventListener("click", () => {
     verdict = true;
-    if (observation) really.value = meta.to ? "on" : "off";
+    outcome = "correct";
     showVerdict();
   });
   wrong.addEventListener("click", () => {
     verdict = false;
-    if (observation) really.value = meta.to ? "off" : "on";
+    showVerdict();
+  });
+  stayedTrue.addEventListener("click", () => {
+    outcome = "stayed_true";
+    showVerdict();
+  });
+  stayedFalse.addEventListener("click", () => {
+    outcome = "stayed_false";
     showVerdict();
   });
   showVerdict();
 
   save.addEventListener("click", async () => {
-    if (verdict === null) {
-      message.textContent = "Choose Correct or Wrong.";
-      return;
-    }
-    if (observation && verdict === false && !really.value) {
-      message.textContent = "Say what it really was, afterwards.";
+    if (observation ? outcome === null : verdict === null) {
+      message.textContent = observation
+        ? "Choose Correct or a No transition."
+        : "Choose Correct or Wrong.";
       return;
     }
     const body = {
-      correct: verdict,
+      ...(observation ? { outcome } : { correct: verdict }),
       interference: [...tags.querySelectorAll("input:checked")]
         .map((input) => input.value),
       notes: notes.value,
     };
-    if (observation && verdict === false) {
-      body.actualValue = really.value === "on";
-    }
 
     save.disabled = true;
     message.textContent = "Saving…";
@@ -1620,6 +1885,9 @@ async function openEvent(id, item) {
 
   const v2Timeline = timeline.classifierVersion === "v2";
   const beeps = timeline.beeps || [];
+  const commandMarks = (timeline.commands || []).map((cmd) => ({
+    t: cmd.t, colour: "#d6a8f0", label: cmd.command,
+  }));
 
   lineChart(chart, c.t, [
     { name: "rms", values: c.rms },
@@ -1630,17 +1898,18 @@ async function openEvent(id, item) {
       { name: "fan", values: c.fan, colour: "#1f9d55" },
       { name: "comp", values: c.compressor, colour: "#d2691e" },
     ],
-    marks: beeps.map((b) => ({ t: b.startSeconds })),
+    marks: [...beeps.map((b) => ({ t: b.startSeconds })), ...commandMarks],
     zeroLine: true,
     xFormat: (v) => v.toFixed(0) + "s",
   } : {
     height: 220,
     states: c.state,
+    marks: commandMarks,
     zeroLine: true,
     xFormat: (v) => v.toFixed(0) + "s",
   });
 
-  if (v2Timeline) {
+  if (v2Timeline && meta.eventType === "beep") {
     body.insertBefore(heading("beep contrast"), body.querySelector(".grid2")
       .previousElementSibling);
     const contrastChart = document.createElement("div");
@@ -1651,7 +1920,7 @@ async function openEvent(id, item) {
       { name: "contrast", values: c.beepContrast, colour: "#e0c341" },
     ], {
       height: 120,
-      marks: beeps.map((b) => ({ t: b.startSeconds })),
+      marks: [...beeps.map((b) => ({ t: b.startSeconds })), ...commandMarks],
       zeroLine: true,
       xFormat: (v) => v.toFixed(0) + "s",
     });
@@ -1661,7 +1930,8 @@ async function openEvent(id, item) {
     ? `${timeline.count} windows, recomputed from the WAV with the ` +
       `settings recorded in the event. The two strips are the published ` +
       `fan and compressor observations, independently; yellow ticks are ` +
-      `beeps found in the audio. Near the left edge the strips are still ` +
+      `beeps found in the audio, purple ticks are commands marked during ` +
+      `the clip. Near the left edge the strips are still ` +
       `warming up, because this replay starts cold.`
     : 
     `${timeline.count} windows, recomputed from the WAV with the ` +

@@ -4,13 +4,33 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>INMP441 Live</title>
-<link rel="stylesheet" href="style.css?v=20261001-5">
+<link rel="stylesheet" href="style.css?v=20261002-1">
 </head>
 <body>
 <header>
   <h1>INMP441 detector</h1>
+  <button id="openSettings" type="button" class="header-button">Settings</button>
   <span id="link" class="pill">connecting</span>
 </header>
+
+<dialog id="settingsDialog">
+  <div class="head">
+    <h2>Settings</h2>
+    <button id="closeSettings" type="button">close</button>
+  </div>
+  <form id="targetForm" class="target-form">
+    <label>
+      <span>TCP stream source</span>
+      <input id="targetInput" type="text" placeholder="host:port"
+             autocomplete="off" spellcheck="false">
+    </label>
+    <button id="applyTarget" type="button" disabled>Connect</button>
+  </form>
+  <p id="targetNote" class="note">Where the backend reads audio from, e.g. 192.168.1.50:3333. Changing it reconnects at once.</p>
+  <form id="settings"></form>
+  <button id="saveSettings" type="button" disabled>Save changes</button>
+  <p id="saved" class="note"></p>
+</dialog>
 
 <main>
   <!-- v1: one combined state. -->
@@ -67,6 +87,7 @@
 
   <section class="card" id="commandCard" hidden>
     <h2>Command marker</h2>
+    <div id="lastCommand" class="note">No command marked yet.</div>
     <form id="commandForm" onsubmit="return false">
       <label><span>command</span>
         <input id="commandName" list="commandNames" placeholder="POWER" autocomplete="off">
@@ -104,13 +125,6 @@
     </div>
     <table id="stream"><tbody></tbody></table>
     <p id="liveAudioNote" class="note">Headphones recommended.</p>
-  </section>
-
-  <section class="card">
-    <h2>Settings</h2>
-    <form id="settings"></form>
-    <button id="saveSettings" type="button" disabled>Save changes</button>
-    <p id="saved" class="note"></p>
   </section>
 
   <section class="card wide">
@@ -192,6 +206,6 @@
   </section>
 </main>
 
-<script type="module" src="app.js?v=20261001-4"></script>
+<script type="module" src="app.js?v=20261002-1"></script>
 </body>
 </html>

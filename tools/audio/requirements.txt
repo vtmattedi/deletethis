@@ -6,3 +6,4 @@ matplotlib
 # backend/ only
 fastapi
 uvicorn[standard]
+paho-mqtt>=2.0

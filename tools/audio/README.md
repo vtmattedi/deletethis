@@ -33,6 +33,15 @@ Open <http://localhost:8000>. The Compose defaults target the ESP32 at
 `10.10.3.17:3333`. To change the stream address, published web port, or
 timezone, copy `.env.example` to `.env` and edit its values before starting.
 
+The stream address can also be changed from the browser: **Settings → TCP
+stream source**. It applies immediately (the backend drops the current
+connection and dials the new address) and is saved next to the other
+runtime settings in `target.json` inside the results folder, so it survives
+container rebuilds. It stays in force only while `AUDIO_TARGET` is
+unchanged; edit `AUDIO_TARGET` in `.env` and restart to override it. Inside
+the container `localhost` is the container itself, so use the ESP32's LAN
+address.
+
 Compose bind-mounts the existing host directory
 `tools/audio/results` at the identical location inside the image. The current
 `audio.db` (including its WAL files), `config.json`, event JSON metadata, and
@@ -469,7 +478,8 @@ and after. A v2 review is about one observation:
 
 | event | fields |
 | --- | --- |
-| `fan`, `compressor` | `correct`; `actualValue` (required when wrong, what it really was afterwards) |
+| `fan`, `compressor` | `outcome`: `correct` (X → Y really happened), `stayed_true` or `stayed_false` (no transition: it was that value throughout). `actualFrom`, `actualTo`, `correct` and `actualValue` are derived. The list's quick buttons are `cor`, `ntt`, `ntf` |
+| `manual` | `actualFan`, `actualCompressor`, `actualBeep` (all three; "Record event now" claims nothing, so you say what was happening) |
 | `beep` | `correct` (`actualBeep` is derived: wrong means it was not a beep) |
 | any | `interference`, `notes` |
 
@@ -483,6 +493,35 @@ card). An event within 10 s of one carries it as `commandContext`
 `PATCH`/`DELETE /api/events/{id}/command-context` set or remove it by
 hand. It is data about the world and nothing reads it back: it does not
 change what is detected.
+
+### MQTT (HiveMQ)
+
+A v2 backend publishes what it observes when `MQTT_HOST` is set, with
+credentials from the environment or a `.env` file (see `.env.example`;
+never from code, and `.env` is git-ignored):
+
+| Topic | Payload | When | Retained |
+| --- | --- | --- | --- |
+| `tester/fan` | `1` / `0` | `fan_detected` changes (and its first value after a start) | yes |
+| `tester/compressor` | `1` / `0` | `compressor_detected` changes (and its first value) | yes |
+| `tester/beep` | `1` | every beep found; there is no `0` | no |
+
+Variables: `MQTT_HOST`, `MQTT_PORT` (8883, TLS, verified against the
+system trust store, which covers HiveMQ Cloud), `MQTT_USERNAME`,
+`MQTT_PASSWORD`, `MQTT_TOPIC_PREFIX` (default `tester`). Publishing is
+QoS 1 on a background thread that reconnects by itself; a broker problem
+is logged and never stops detection. `/api/status` shows `mqtt`
+(connected, published count, last error). Compose passes `.env` through.
+Only v2 publishes; v1 has no independent observations.
+
+**Commands over MQTT.** Watson also subscribes to `tester/sent`; a
+payload there is the code of a command the controller just sent, and is
+recorded as a command marker. It travels controller → broker → here, so
+it is dated `MQTT_SENT_LATENCY_SECONDS` (default 2.0) before it arrived,
+and a code that arrives after its event was already saved is still
+attached to that event (within 10 s of its start). Markers show as purple
+ticks on the history chart and on an event's graph, and as a badge on the
+event.
 
 ### v2 settings
 

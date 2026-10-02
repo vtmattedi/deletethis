@@ -24,6 +24,7 @@ from .classifier import make_classifier_service
 from .config import AppConfig
 from .events import EventRecorder
 from .history import HistoryStore
+from .mqtt_publisher import MqttPublisher, MqttSettings
 
 RECONNECT_DELAY_SECONDS = 2.0
 # A missing frame or two is common on this stream and only represents
@@ -73,6 +74,9 @@ class StreamService(threading.Thread):
 
         self.config = config
         self.stop_event = threading.Event()
+        # Set when the stream address changes: ends the current session
+        # and cuts the wait before the next one short.
+        self._retarget = threading.Event()
 
         self.lock = threading.Lock()
         self.health = StreamHealth()
@@ -106,6 +110,24 @@ class StreamService(threading.Thread):
             "fan": None, "compressor": None,
         }
 
+        # v2 observations go out over MQTT when a broker is configured
+        # (MQTT_HOST and friends in the environment); otherwise None.
+        self.mqtt: MqttPublisher | None = None
+        mqtt_settings = (
+            MqttSettings.from_env()
+            if config.classifier.version == "v2" else None
+        )
+        if mqtt_settings is not None:
+            self.mqtt = MqttPublisher(mqtt_settings)
+            # A code on <prefix>/sent means the controller sent a command.
+            # It travels controller -> broker -> here, so it is dated
+            # earlier than it arrived (MQTT_SENT_LATENCY_SECONDS).
+            self.mqtt.on_sent = lambda code: self.record_command(
+                code, True, f"mqtt {self.mqtt.topic('sent')}",
+                delay=mqtt_settings.sent_latency,
+            )
+            self.mqtt.start()
+
         # Events carry the commands the operator said they sent nearby.
         self.events.command_lookup = self.history.commands_between
 
@@ -120,12 +142,19 @@ class StreamService(threading.Thread):
             except Exception as error:      # never kill the thread
                 self._fail(f"{type(error).__name__}: {error}")
 
-            if self.stop_event.wait(RECONNECT_DELAY_SECONDS):
+            self._retarget.wait(RECONNECT_DELAY_SECONDS)
+
+            if self.stop_event.is_set():
                 return
 
     def _session(self) -> None:
+        self._retarget.clear()
+
+        with self.lock:
+            target = self.config.target
+
         stream = AudioStream(
-            self.config.target,
+            target,
             verbose=False,
             boot_wait=0.0,
         )
@@ -135,13 +164,13 @@ class StreamService(threading.Thread):
         info = stream.info
         assert info is not None
 
-        self._on_connected(info)
+        self._on_connected(info, target)
 
         missing = 0
 
         try:
             for frame in stream.frames():
-                if self.stop_event.is_set():
+                if self.stop_event.is_set() or self._retarget.is_set():
                     return
 
                 missing = self._check_gap(stream, info, missing)
@@ -245,6 +274,10 @@ class StreamService(threading.Thread):
 
             print(f"{name}: settled on {'on' if value else 'off'}")
 
+            # Subscribers need the starting value too.
+            if self.mqtt is not None:
+                self.mqtt.publish_observation(name, value)
+
             return
 
         if previous == value:
@@ -273,9 +306,15 @@ class StreamService(threading.Thread):
 
         self._previous_observation[name] = value
 
+        if self.mqtt is not None:
+            self.mqtt.publish_observation(name, value)
+
     def _on_beep(self, beep, decision) -> None:
         """A beep is an event in its own right, not a state."""
         assert self.classifier is not None
+
+        if self.mqtt is not None:
+            self.mqtt.publish_beep()
 
         snapshot = self.classifier.current()
 
@@ -422,7 +461,7 @@ class StreamService(threading.Thread):
 
     # -------------------------------------------------- bookkeeping
 
-    def _on_connected(self, info) -> None:
+    def _on_connected(self, info, target: str) -> None:
         with self.lock:
             self.health.connected = True
             self.health.sample_rate = info.sample_rate
@@ -431,7 +470,11 @@ class StreamService(threading.Thread):
             self.health.last_error = ""
             self.health.connected_since = time.monotonic()
 
-        if self.classifier is None:
+        # A different device may run at a different sample rate.
+        if (
+            self.classifier is None
+            or self.classifier.sample_rate != info.sample_rate
+        ):
             self.classifier = make_classifier_service(
                 info.sample_rate,
                 self.config.classifier,
@@ -445,13 +488,13 @@ class StreamService(threading.Thread):
         self._break_continuity()
 
         self.history.record_connection(
-            True, f"connected to {self.config.target}"
+            True, f"connected to {target}"
         )
 
         self.ready.set()
 
         print(
-            f"stream: connected to {self.config.target} "
+            f"stream: connected to {target} "
             f"({info.sample_rate} Hz, "
             f"{info.frame_samples} samples/frame)"
         )
@@ -529,7 +572,8 @@ class StreamService(threading.Thread):
     # --------------------------------------------------- commands
 
     def record_command(
-        self, command: str, expected_beep: bool, note: str = ""
+        self, command: str, expected_beep: bool, note: str = "",
+        delay: float = 0.0,
     ) -> dict:
         """Note that the operator just sent a command.
 
@@ -543,8 +587,14 @@ class StreamService(threading.Thread):
         )
 
         marker = self.history.record_command(
-            command, expected_beep, stream_seconds, note
+            command, expected_beep, max(0.0, stream_seconds - delay), note,
+            delay=delay,
         )
+
+        late = self.events.attach_late_command(marker)
+
+        if late:
+            print(f"command: attached to {len(late)} earlier event(s)")
 
         print(
             f"command: {command}"
@@ -567,10 +617,32 @@ class StreamService(threading.Thread):
 
         payload["history"] = self.history.status()
 
+        if self.mqtt is not None:
+            payload["mqtt"] = self.mqtt.status()
+
+        recent = self.history.commands_between(time.time() - 3600, time.time())
+        payload["lastCommand"] = recent[-1] if recent else None
+
         return payload
+
+    def set_target(self, target: str) -> None:
+        """Point the stream at another address, reconnecting now."""
+        with self.lock:
+            changed = target != self.config.target
+            self.config.target = target
+
+        if changed:
+            print(f"stream: target changed to {target}")
+
+        # Also retries at once if the old address was failing.
+        self._retarget.set()
 
     def stop(self) -> None:
         self.stop_event.set()
+        self._retarget.set()
 
     def close(self) -> None:
+        if self.mqtt is not None:
+            self.mqtt.stop()
+
         self.history.close()

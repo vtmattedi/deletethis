@@ -20,3 +20,9 @@ tools/audio/recordings
 .idea
 compile_commands.json
 managed_components
+
+# Credentials come in at run time (compose env_file), never baked in.
+.env
+.env.*
+**/.env
+**/.env.*

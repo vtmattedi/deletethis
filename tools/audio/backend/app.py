@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -23,12 +24,14 @@ if __package__ in (None, ""):
     from backend.config import ClassifierConfig
     from backend.events import event_timeline
     from backend.history import to_epoch
+    from backend.mqtt_publisher import load_env_file
     from backend.models import (
         CommandContext,
         CommandMarker,
         ConfigPatch,
         EventBulkReviewRequest,
         EventDeleteRequest,
+        TargetPatch,
         review_for_event,
     )
     from backend.stream import StreamService
@@ -37,12 +40,14 @@ else:
     from .config import ClassifierConfig
     from .events import event_timeline
     from .history import to_epoch
+    from .mqtt_publisher import load_env_file
     from .models import (
         CommandContext,
         CommandMarker,
         ConfigPatch,
         EventBulkReviewRequest,
         EventDeleteRequest,
+        TargetPatch,
         review_for_event,
     )
     from .stream import StreamService
@@ -134,14 +139,27 @@ def _bulk_review_fields(metadata: dict, request) -> dict:
         "eventType"
     ):
         body = {
-            "correct": verdict,
             "interference": request.interference,
             "notes": request.notes,
         }
         event_type = metadata["eventType"]
 
+        if request.outcome is not None:
+            # "No transition" describes an observation; a beep has none.
+            if event_type == "beep":
+                if request.outcome != "correct":
+                    raise ValueError(
+                        "a beep is correct or not a beep; use "
+                        "correct=false for that"
+                    )
+                body["correct"] = True
+            else:
+                body["outcome"] = request.outcome
+        else:
+            body["correct"] = verdict
+
         if event_type in ("fan", "compressor") and request.actualValue \
-                is not None:
+                is not None and request.outcome is None:
             body["actualValue"] = request.actualValue
 
         if event_type == "beep" and request.actualBeep is not None:
@@ -206,8 +224,36 @@ def create_app(settings: AppConfig) -> FastAPI:
         payload = service.status()
         payload["classifierVersion"] = settings.classifier.version
         payload["config"] = settings.to_api()
+        payload["target"] = settings.target
 
         return payload
+
+    # ------------------------------------------------------ stream
+
+    @app.get("/api/stream/target")
+    async def get_target() -> dict:
+        return {"target": settings.target}
+
+    @app.put("/api/stream/target")
+    async def put_target(patch: TargetPatch) -> dict:
+        try:
+            config_module.write_runtime_config(
+                settings.target_path,
+                {
+                    "target": patch.target,
+                    "launchTarget": settings.launch_target,
+                },
+            )
+        except OSError as error:
+            raise HTTPException(
+                status_code=500,
+                detail=f"could not save stream target: {error}",
+            ) from error
+
+        # Drops the current connection and dials the new address at once.
+        service.set_target(patch.target)
+
+        return {"target": settings.target}
 
     # ------------------------------------------------------ config
 
@@ -488,6 +534,28 @@ def create_app(settings: AppConfig) -> FastAPI:
         timeline["id"] = identifier
         timeline["classifierConfig"] = recorded.to_api()
 
+        # Commands marked during the clip, placed on its axis (seconds
+        # from the moment of the event, like the rest of the timeline).
+        audio = metadata.get("audio", {})
+        trigger = metadata.get("triggerEpoch")
+
+        if trigger is None and metadata.get("time"):
+            # Older events: second resolution only.
+            trigger = datetime.fromisoformat(metadata["time"]).timestamp()
+
+        timeline["commands"] = [] if trigger is None else [
+            {
+                "t": round(c["time"] - trigger, 3),
+                "command": c["command"],
+                "expectedBeep": c["expectedBeep"],
+                "note": c["note"],
+            }
+            for c in service.history.commands_between(
+                trigger - audio.get("preSeconds", 0.0),
+                trigger + audio.get("postSeconds", 0.0),
+            )
+        ]
+
         return timeline
 
     # ----------------------------------------------------- history
@@ -515,7 +583,11 @@ def create_app(settings: AppConfig) -> FastAPI:
         if start > end:
             start, end = end, start
 
-        return service.history.query(start, end, points)
+        result = service.history.query(start, end, points)
+        # Commands the operator (or the controller, over MQTT) said were
+        # sent, so the chart can mark them.
+        result["commands"] = service.history.commands_between(start, end)
+        return result
 
     # -------------------------------------------------------- live
 
@@ -680,6 +752,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    # Credentials (MQTT_*) live in .env, never in the code. Variables
+    # already in the environment win over the file.
+    here = Path(__file__).resolve()
+    for env_file in (
+        here.parents[3] / ".env",
+        here.parents[1] / ".env",
+        here.parent / ".env",
+    ):
+        load_env_file(env_file)
+
     settings = AppConfig.for_version(
         args.classifier,
         target=args.target,
@@ -695,6 +777,18 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if changes:
             print(f"config: loaded {settings.config_path}")
+
+    # An address chosen in the web UI outlasts --target / AUDIO_TARGET.
+    try:
+        saved_target = config_module.load_saved_target(
+            settings.target_path, settings.launch_target
+        )
+    except (OSError, ValueError) as error:
+        print(f"config: ignoring invalid {settings.target_path}: {error}")
+    else:
+        if saved_target:
+            settings.target = saved_target
+            print(f"config: stream target from {settings.target_path}")
 
     print("Backend starting")
     print(f"ESP32: {settings.target}")

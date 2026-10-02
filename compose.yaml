@@ -10,6 +10,13 @@ services:
       - 0.0.0.0
       - --port
       - "8000"
+    # Credentials (MQTT_*) are read at run time and are not in the image
+    # (see .dockerignore). Later files win.
+    env_file:
+      - path: .env
+        required: false
+      - path: tools/audio/backend/.env
+        required: false
     environment:
       TZ: ${AUDIO_TIMEZONE:-America/Sao_Paulo}
     ports:

@@ -329,6 +329,10 @@ class EventConfig:
 @dataclass
 class AppConfig:
     target: str = DEFAULT_TARGET
+    # What --target / AUDIO_TARGET said at launch. A target saved from
+    # the web UI only holds while this is unchanged, so editing .env and
+    # restarting compose still takes effect.
+    launch_target: str = ""
     http_host: str = DEFAULT_HTTP_HOST
     http_port: int = DEFAULT_HTTP_PORT
     live_hz: float = DEFAULT_LIVE_HZ
@@ -344,6 +348,8 @@ class AppConfig:
     config_path: Path = RUNTIME_CONFIG
 
     def __post_init__(self) -> None:
+        if not self.launch_target:
+            self.launch_target = self.target
         self.check_isolation()
 
     @classmethod
@@ -399,11 +405,34 @@ class AppConfig:
                     f"the v2 results ({resolved})"
                 )
 
+    @property
+    def target_path(self) -> Path:
+        """Where a stream address chosen in the web UI is remembered."""
+        return Path(self.config_path).with_name("target.json")
+
     def to_api(self) -> dict:
         payload = self.classifier.to_api()
         payload.update(self.events.to_api())
 
         return payload
+
+
+def load_saved_target(path: Path, launch_target: str) -> str | None:
+    """The stream address saved from the web UI, if it still applies.
+
+    It was chosen against a particular launch target. If that has since
+    changed (e.g. AUDIO_TARGET edited in .env), the operator has spoken
+    more recently than the browser did, so the saved address is dropped.
+    """
+    if not path.is_file():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    target = payload.get("target") if isinstance(payload, dict) else None
+    if not isinstance(target, str) or not target:
+        raise ValueError("saved target must be {\"target\": \"host:port\"}")
+    if payload.get("launchTarget") != launch_target:
+        return None
+    return target
 
 
 def load_runtime_config(path: Path) -> dict:
@@ -417,7 +446,7 @@ def load_runtime_config(path: Path) -> dict:
 
 
 def write_runtime_config(path: Path, payload: dict) -> None:
-    """Atomically replace the persisted runtime settings."""
+    """Atomically replace the persisted runtime settings (or target)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:

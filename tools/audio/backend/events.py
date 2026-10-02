@@ -534,6 +534,8 @@ class EventRecorder:
                 "classifierVersion", "v1"
             ),
             "time": event.started.isoformat(timespec="seconds"),
+            # Exact, for placing other things (commands) on its timeline.
+            "triggerEpoch": round(event.started.timestamp(), 3),
             "from": event.from_state,
             "to": event.to_state,
             "source": event.source,
@@ -591,14 +593,45 @@ class EventRecorder:
 
         nearest = min(commands, key=lambda c: abs(c["time"] - trigger))
 
+        return self._context(nearest, trigger)
+
+    @staticmethod
+    def _context(marker: dict, trigger: float) -> dict:
         return {
-            "command": nearest["command"],
+            "command": marker["command"],
             # Stream seconds, like the beep's own timestamps.
-            "sentAt": nearest["streamSeconds"],
-            "expectedBeep": nearest["expectedBeep"],
-            "secondsFromEvent": round(nearest["time"] - trigger, 2),
-            "note": nearest.get("note", ""),
+            "sentAt": marker["streamSeconds"],
+            "expectedBeep": marker["expectedBeep"],
+            "secondsFromEvent": round(marker["time"] - trigger, 2),
+            "note": marker.get("note", ""),
         }
+
+    def attach_late_command(self, marker: dict) -> list[str]:
+        """Give a command that arrived late to events already written.
+
+        A command reported over a network can reach us after the event it
+        belongs to has been saved. Events with no command yet, triggered
+        within the window of this one, take it. Returns their ids.
+        """
+        with self.lock:
+            candidates = [
+                (item["id"], item["triggerEpoch"])
+                for item in self.written
+                if "commandContext" not in item
+                and item.get("triggerEpoch") is not None
+                and abs(marker["time"] - item["triggerEpoch"])
+                <= self.COMMAND_WINDOW_SECONDS
+            ]
+
+        attached = []
+
+        for identifier, trigger in candidates:
+            if self.annotate(
+                identifier, {"commandContext": self._context(marker, trigger)}
+            ):
+                attached.append(identifier)
+
+        return attached
 
     def list_events(
         self,
@@ -631,7 +664,9 @@ class EventRecorder:
         review = metadata.get("review", {})
         result = (
             "unreviewed" if review.get("status") != "reviewed"
-            else "correct" if review.get("classificationCorrect")
+            else "correct" if review.get(
+                "correct", review.get("classificationCorrect")
+            )
             else "incorrect"
         )
         observations = metadata.get("observations") or {}
@@ -645,6 +680,7 @@ class EventRecorder:
                 if state is not None
             ),
             metadata.get("source"), review.get("status"),
+            (metadata.get("commandContext") or {}).get("command"),
             review.get("actualFrom"), review.get("actualTo"),
             review.get("notes"),
             result,

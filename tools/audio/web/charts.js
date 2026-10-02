@@ -232,6 +232,16 @@ export function lineChart(host, t, series, options = {}) {
       stroke: mark.colour || "#e0c341", "stroke-width": 1.5,
       opacity: 0.9,
     }));
+
+    if (mark.label) {
+      const text = el("text", {
+        x: Math.min(x(mark.t) + 3, left + plotW - 4), y: top + 20,
+        fill: mark.colour || "#e0c341", "font-size": "10",
+        "text-anchor": x(mark.t) > left + plotW - 80 ? "end" : "start",
+      });
+      text.textContent = mark.label;
+      svg.append(text);
+    }
   }
 
   // x labels

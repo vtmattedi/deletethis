@@ -256,9 +256,15 @@ class HistoryStore:
         expected_beep: bool,
         stream_seconds: float,
         note: str = "",
+        delay: float = 0.0,
     ) -> dict:
-        """Note that a command was sent now. Returns what was stored."""
-        moment = time.time()
+        """Note that a command was sent. Returns what was stored.
+
+        ``delay`` is how long ago it was really sent, for a command
+        reported over a network: it is stored at the estimated send time,
+        not the arrival time.
+        """
+        moment = time.time() - delay
 
         with self.lock:
             self.connection.execute(
