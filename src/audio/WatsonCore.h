@@ -89,6 +89,12 @@ namespace watson
         // hole is discarded.
         void discontinuity();
 
+        // The microphone went away or came back. Beyond a discontinuity this
+        // forgets the published fan/compressor values: they were produced by
+        // audio that is not a measurement of the room, and the first value
+        // after the hardware returns must be earned fresh.
+        void hardwareChanged();
+
         // -1 until the first hold elapses, then 0 / 1.
         int8_t fanPublished() const { return fanHold_.published(); }
         int8_t compressorPublished() const { return compressorHold_.published(); }

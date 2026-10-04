@@ -71,6 +71,9 @@ namespace watson
         // A firmware update is (not) running; see AudioCapture::setMaintenance.
         void setMaintenance(bool active) { capture_.setMaintenance(active); }
 
+        // Test hook: pretend the microphone is dead (WATSON SIMFLAT).
+        void simulateDeadMic(bool on) { capture_.setSimulateFlat(on); }
+
         const AnalysisStats &analysis() const { return stats_; }
         const AudioCapture &capture() const { return capture_; }
 
@@ -99,6 +102,8 @@ namespace watson
         DetectorParams applied_;
         DetectorParams lastPolled_;
         uint32_t lastPollMs_ = 0;
+        bool hardwareSeen_ = true;     // analysis task's view
+        bool hardwareSent_ = true;     // what NightMare was last told
         uint32_t lastPsCheckMs_ = 0;
         uint32_t psRestored_ = 0;
         bool settled_ = false;

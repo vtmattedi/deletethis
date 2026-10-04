@@ -85,6 +85,14 @@ namespace watson
             since_ = 0;
         }
 
+        // The published value can no longer be trusted (the hardware that
+        // produced it is gone): back to "nothing published yet".
+        void forget()
+        {
+            resetCandidate();
+            published_ = kUnknown;
+        }
+
         void setHoldMs(uint32_t ms) { holdMs_ = ms; }
 
         // True when the published value just changed.

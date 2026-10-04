@@ -58,8 +58,23 @@ namespace
             watson::runSelfTest(text, sizeof(text));
             result.response = text;
         }
+        else if (message.subcommand == "SIMFLAT")
+        {
+            // Test hook: make the acquisition see a dead microphone, to
+            // exercise the flatline -> hardware-disconnected path without
+            // unplugging anything.  WATSON SIMFLAT ON | OFF
+            const bool on = message.args[0].equalsIgnoreCase("ON");
+            if (!on && !message.args[0].equalsIgnoreCase("OFF"))
+                result.response = "usage: WATSON SIMFLAT ON | OFF";
+            else
+            {
+                watson::gWatson.simulateDeadMic(on);
+                result.response = on ? "simulating a dead microphone"
+                                     : "microphone input restored";
+            }
+        }
         else
-            result.response = "usage: WATSON STATS | WATSON SELFTEST";
+            result.response = "usage: WATSON STATS | SELFTEST | SIMFLAT ON|OFF";
         return result;
     }
 } // namespace
@@ -93,6 +108,29 @@ void onOta(OTA_INFO info, int data)
     }
 }
 
+// ESP-NOW is Watson's preferred connection, with MQTT as the failover.
+// NightMare's own default is MQTT and the preference is a persistent Config, so
+// it is applied once -- recorded in this marker -- and a later
+// `CONFIG SET nightmare:connection:preferred_connection` is respected.
+static Config<bool> espnowPreferenceApplied("acoustic:connection:espnow_preferred_applied",
+                                            false);
+
+static void preferEspNowOnce()
+{
+    if (espnowPreferenceApplied.value())
+        return;
+
+    const int espnow = static_cast<int>(NightMare::ConnectionType::ESP_NOW);
+    if (NightMare::preferredConnection.value() != espnow)
+    {
+        NightMare::preferredConnection.set(espnow);
+        // Also move off whatever was started from the previous preference.
+        NightMare::SelectConnection(NightMare::ConnectionType::ESP_NOW);
+        Serial.println("# watson: preferred connection set to ESP-NOW (failover: MQTT)");
+    }
+    espnowPreferenceApplied.set(true);
+}
+
 void setup()
 {
     Serial.begin(921600);
@@ -119,6 +157,7 @@ void setup()
     // Resources and Configs are declared and bound; NightMare restores the
     // persisted Configs and starts Wi-Fi, MQTT and OTA from here.
     startNightMareESP();
+    preferEspNowOnce();
 
     watson::gWatson.startAnalysis();
 

@@ -180,6 +180,41 @@ queue on its own task; if the client or link cannot keep up, blocks are dropped
 
 Build it out with `-DENABLE_TCP=0` (`pio run -e esp32dev-notcp`).
 
+## Microphone presence (hardware flag)
+
+`fan_detected` and `compressor_detected` declare NightMare's hardware policy
+with `REPORT_HW_CONNECTION`, so their manifest entries carry
+`hardware.connected`. GPIO33 (INMP441 SD) has the internal pulldown enabled, so
+an unplugged or unpowered microphone reads as constant zero instead of floating
+noise. A block whose 24-bit samples span <= 8 LSB is "flat" (a live INMP441 is
+hundreds of LSB even in a silent room); 32 flat blocks in a row (1.02 s) mark the
+hardware disconnected, 16 live blocks in a row (0.5 s) mark it back.
+
+While disconnected the sensors keep their last value, `hardware.connected` is
+false, and nothing the detectors conclude from silence is published. On both
+transitions the analysis drops its history and forgets the published values, so
+the first value after the microphone returns is earned fresh (hold included).
+`WATSON SIMFLAT ON|OFF` makes the acquisition see a dead microphone, to exercise
+this without unplugging anything; `WATSON STATS` has a `microphone:` line.
+Host tests: `replay --flatline-selftest` (debounce boundaries, stuck-high line)
+and `replay --flatline <pcm>` (87 real recordings: 0 disconnects).
+
+## Connection: ESP-NOW preferred
+
+`NM_NETWORK_ESPNOW 1`. ESP-NOW (to the NightMare gateway) is the preferred
+connection and the remote TLS broker is the failover, used when no gateway
+answers within `nightmare:connection:failover_secs` (60 s). The preference is
+applied once on first boot (marker Config `acoustic:connection:espnow_preferred_applied`),
+so a later `CONFIG SET nightmare:connection:preferred_connection` is respected.
+`creds.h` needs `NM_ESPNOW_PSK`, the gateway's network key (16-64 bytes); the
+shipped value is a placeholder and must be replaced.
+
+NightMare runs the Wi-Fi station only while an MQTT profile is selected, so
+**while ESP-NOW is connected there is no IP link**: SNTP, OTA and the raw PCM
+debug server are unavailable until the device fails over (or you run
+`NETWORK SET MQTT`). ESP-NOW also adds tasks (client, rx log, worker), which the
+~35 KB heap budget below has to absorb: untested on hardware.
+
 ## Validation
 
 ```text
@@ -217,8 +252,7 @@ Results (committed in `validation/results/`):
   ~200 ms at about 1.7 s (5 I2S overruns). I2S starts after it, but the PHY
   calibration stall still lands in that window; the `steady:` line in `WATSON
   STATS` counts from 15 s.
-* **OTA**: enabled through NightMare and the partition table supports it, but
-  uploads from the development PC aborted mid-transfer (60-80 %) over this
+* **OTA**: works (one upload completed on a clean link); other uploads from the development PC aborted mid-transfer (60-80 %) over this
   room's Wi-Fi link even with the audio stack off. The espota host protocol is
   stop-and-wait with a 10 s timeout and the link showed 10-20 % ping loss at
   times. Flash writes during an update stall the instruction cache, so audio is

@@ -84,6 +84,21 @@ namespace watson
         // expects. Nothing has a value until the first hold elapses.
         installDetectorConfigHandlers();
 
+        // Both observations come from one physical microphone, and NightMare
+        // can say whether that hardware is there: declaring REPORT_HW_CONNECTION
+        // makes the manifest carry `hardware.connected`, which pump() keeps
+        // current from the flatline detector. (Declared before the Resources
+        // are bound, so nothing is republished for it.)
+        {
+            HardwarePolicy mic;
+            mic.pollMs = 0;
+            mic.flags = REPORT_HW_CONNECTION;
+            mic.note = "INMP441 mic, I2S SD on GPIO33";
+            if (!fanDetected.setHardwarePolicy(mic) ||
+                !compressorDetected.setHardwarePolicy(mic))
+                Serial.println("# watson: could not declare the hardware policy");
+        }
+
         // I2S is started in startAnalysis(), after NightMare is up. Its start-up
         // does flash work (filesystem mount, settings restore) that stalls
         // every task for hundreds of milliseconds -- more than the DMA ring
@@ -155,6 +170,19 @@ namespace watson
                 stats_.maxQueueDepth = depth;
 
             applyPendingParams();
+
+            // The microphone went away or came back. Whatever was observed
+            // through it is not a measurement of the room: forget the
+            // published values and start the holds over.
+            const bool hardware = capture_.hardwareConnected();
+            if (hardware != hardwareSeen_)
+            {
+                hardwareSeen_ = hardware;
+                core_->hardwareChanged();
+                fanState_.store(-1, std::memory_order_release);
+                compressorState_.store(-1, std::memory_order_release);
+            }
+
             core_->drain(analysisQueue_, &WatsonAcoustic::stepTrampoline, this);
 
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
@@ -175,6 +203,12 @@ namespace watson
         stats_.sumWindowUs = stats_.sumWindowUs + elapsedUs;
         if (elapsedUs > stats_.maxWindowUs)
             stats_.maxWindowUs = elapsedUs;
+
+        // With no microphone the detectors are listening to silence. Nothing
+        // they conclude is published; the sensors keep their last value and say
+        // the hardware is disconnected.
+        if (!hardwareSeen_)
+            return;
 
         if (step.fanChanged)
             fanState_.store(core_->fanPublished(), std::memory_order_release);
@@ -284,6 +318,16 @@ namespace watson
         }
 #endif
 
+        const bool hardware = capture_.hardwareConnected();
+        if (hardware != hardwareSent_ &&
+            fanDetected.setHardwareConnected(hardware) &&
+            compressorDetected.setHardwareConnected(hardware))
+        {
+            hardwareSent_ = hardware;
+            Serial.printf("# watson: microphone %s\n",
+                          hardware ? "connected" : "DISCONNECTED (flatline)");
+        }
+
         const int8_t fan = fanState_.load(std::memory_order_acquire);
         if (fan != fanSent_ && fan >= 0)
         {
@@ -360,6 +404,10 @@ namespace watson
         add("ota:         acquisition pauses=%lu%s\n",
             (unsigned long)c.maintenancePauses,
             capture_.inMaintenance() ? "  (PAUSED: update running)" : "");
+        add("microphone:  %s  flat_blocks=%lu transitions=%lu%s\n",
+            capture_.hardwareConnected() ? "connected" : "DISCONNECTED",
+            (unsigned long)c.flatBlocks, (unsigned long)c.hardwareTransitions,
+            capture_.simulateFlat() ? "  (SIMFLAT test hook on)" : "");
 
         add("analysis:    windows=%lu blocks_lost=%lu resets=%lu "
                  "avg_us=%lu max_us=%lu max_queue=%lu/%d beeps_lost=%lu\n",

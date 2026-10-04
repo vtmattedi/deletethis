@@ -21,6 +21,7 @@
 
 #include "../../src/audio/AudioBuffer.h"
 #include "../../src/audio/DetectorParams.h"
+#include "../../src/audio/FlatlineDetector.h"
 #include "../../src/audio/SelfTest.h"
 #include "../../src/audio/WatsonCore.h"
 
@@ -94,8 +95,88 @@ static bool setParam(DetectorParams &p, const std::string &key, double v)
     return false;
 }
 
+// --flatline-selftest : synthetic checks of the dead-microphone detector.
+// --flatline <pcm>    : run it over a recording; real audio must never flatline.
+static int flatlineMain(int argc, char **argv)
+{
+    int32_t noise[kBlockSamples], zeros[kBlockSamples], stuck[kBlockSamples];
+    uint32_t x = 12345;
+    for (int i = 0; i < kBlockSamples; i++)
+    {
+        x = x * 1664525u + 1013904223u;
+        noise[i] = static_cast<int32_t>(x >> 20) - 2048; // ~12-bit noise
+        zeros[i] = 0;
+        stuck[i] = -1; // SD stuck high: raw 0xFFFFFFFF >> 8
+    }
+
+    if (std::string(argv[1]) == "--flatline-selftest")
+    {
+        int failures = 0;
+        auto expect = [&](bool ok, const char *what)
+        {
+            printf("%-58s %s\n", what, ok ? "PASS" : "FAIL");
+            failures += !ok;
+        };
+
+        FlatlineDetector d;
+        bool flipped = false;
+        for (int i = 0; i < 100; i++)
+            flipped |= d.update(noise, kBlockSamples);
+        expect(!flipped && d.connected(), "noise keeps the microphone connected");
+
+        for (uint32_t i = 0; i < FlatlineDetector::kBlocksToDisconnect - 1; i++)
+            d.update(zeros, kBlockSamples);
+        expect(d.connected(), "31 flat blocks (just under 1 s): still connected");
+        expect(d.update(zeros, kBlockSamples) && !d.connected(),
+               "the 32nd flat block: disconnected, reported once");
+        expect(!d.update(zeros, kBlockSamples), "more flat blocks: no further transition");
+
+        for (uint32_t i = 0; i < FlatlineDetector::kBlocksToReconnect - 1; i++)
+            d.update(noise, kBlockSamples);
+        expect(!d.connected(), "15 live blocks: still disconnected");
+        d.update(zeros, kBlockSamples);
+        for (uint32_t i = 0; i < FlatlineDetector::kBlocksToReconnect - 1; i++)
+            d.update(noise, kBlockSamples);
+        expect(!d.connected(), "a flat block restarts the live count");
+        expect(d.update(noise, kBlockSamples) && d.connected(),
+               "16 consecutive live blocks: connected again");
+
+        FlatlineDetector s;
+        for (uint32_t i = 0; i < FlatlineDetector::kBlocksToDisconnect; i++)
+            s.update(stuck, kBlockSamples);
+        expect(!s.connected(), "a stuck non-zero level is a flatline too");
+
+        FlatlineDetector g;
+        for (uint32_t i = 0; i < 200; i++)
+            g.update(i % 40 == 39 ? zeros : noise, kBlockSamples);
+        expect(g.connected() && g.transitions() == 0,
+               "isolated flat blocks in live audio never disconnect");
+        printf("%s\n", failures ? "FAIL" : "PASS");
+        return failures ? 1 : 0;
+    }
+
+    FILE *in = fopen(argv[2], "rb");
+    if (!in)
+        return 1;
+    FlatlineDetector d;
+    int32_t block[kBlockSamples];
+    uint32_t blocks = 0;
+    while (fread(block, sizeof(int32_t), kBlockSamples, in) == kBlockSamples)
+    {
+        d.update(block, kBlockSamples);
+        blocks++;
+    }
+    fclose(in);
+    printf("blocks=%u flat=%u transitions=%u connected=%d\n", blocks,
+           d.flatBlocks(), d.transitions(), d.connected() ? 1 : 0);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc >= 2 && std::string(argv[1]).rfind("--flatline", 0) == 0)
+        return flatlineMain(argc, argv);
+
     if (argc == 2 && std::string(argv[1]) == "--selftest")
     {
         char text[1024];

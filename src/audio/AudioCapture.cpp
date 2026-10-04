@@ -74,6 +74,14 @@ namespace watson
             Serial.printf("ERROR: i2s_channel_enable(): %d\n", err);
             return false;
         }
+
+        // Internal pulldown on SD. The INMP441 drives the line only in its own
+        // slot and tri-states it otherwise; with the mic unplugged or its SD
+        // wire broken the pin would float and pick up noise that looks like
+        // audio. Pulled low it reads constant zero, which the flatline
+        // detector recognises as "no hardware". Applied after the peripheral
+        // is up so the driver's pin setup cannot undo it.
+        gpio_set_pull_mode(static_cast<gpio_num_t>(kI2sDin), GPIO_PULLDOWN_ONLY);
         return true;
     }
 
@@ -181,8 +189,29 @@ namespace watson
 
             // Right-align the 24-bit sample in the 32-bit word, so nothing
             // downstream needs to know about the I2S padding.
-            for (int i = 0; i < kBlockSamples; i++)
-                block_.samples[i] = raw_[i] >> 8;
+            if (simulateFlat_)
+            {
+                // Test hook (WATSON SIMFLAT): behave as if the mic were dead.
+                for (int i = 0; i < kBlockSamples; i++)
+                    block_.samples[i] = 0;
+            }
+            else
+            {
+                for (int i = 0; i < kBlockSamples; i++)
+                    block_.samples[i] = raw_[i] >> 8;
+            }
+
+            // Is a microphone there at all? A flat block is one whose samples
+            // barely move. The change of state is reported as a gap too, so
+            // the analysis drops what it was building around it.
+            if (flatline_.update(block_.samples, kBlockSamples))
+            {
+                hardwareConnected_ = flatline_.connected();
+                stats_.hardwareTransitions = stats_.hardwareTransitions + 1;
+                pendingGap = true;
+            }
+            stats_.flatBlocks = flatline_.flatBlocks();
+
             block_.seq = seq_++;
             block_.capturedMs = static_cast<uint32_t>(nowUs / 1000);
             block_.i2sGap = gap;

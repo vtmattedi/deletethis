@@ -83,6 +83,13 @@ namespace watson
         stats_.discontinuities++;
     }
 
+    void WatsonCore::hardwareChanged()
+    {
+        discontinuity();
+        fanHold_.forget();
+        compressorHold_.forget();
+    }
+
     int WatsonCore::drain(BlockQueue &queue, StepFn onStep, void *context)
     {
         int analysed = 0;

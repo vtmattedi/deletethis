@@ -7,6 +7,7 @@
 
 #include "AudioBuffer.h"
 #include "AudioConfig.h"
+#include "FlatlineDetector.h"
 
 namespace watson
 {
@@ -36,6 +37,8 @@ namespace watson
         volatile uint32_t lastLateAtMs = 0;
         volatile uint32_t lastLateUs = 0;
         volatile uint32_t maintenancePauses = 0; // updates that paused acquisition
+        volatile uint32_t flatBlocks = 0;        // blocks whose samples barely move
+        volatile uint32_t hardwareTransitions = 0; // connected <-> disconnected
     };
 
     // Owns the I2S peripheral and the acquisition task, and nothing else: it
@@ -64,6 +67,15 @@ namespace watson
         // was building and the published observations stay.
         void setMaintenance(bool active) { maintenance_ = active; }
         bool inMaintenance() const { return maintenance_; }
+
+        // Is a microphone delivering audio? False after a second of flat
+        // blocks (unplugged, unpowered, broken SD wire), true again after half
+        // a second of live ones. Safe to read from any task.
+        bool hardwareConnected() const { return hardwareConnected_; }
+
+        // Test hook: make the acquisition see a dead (all-zero) microphone.
+        void setSimulateFlat(bool on) { simulateFlat_ = on; }
+        bool simulateFlat() const { return simulateFlat_; }
         uint32_t blocksSeen() const { return seq_; }
         uint32_t stackFreeBytes() const
         {
@@ -84,6 +96,9 @@ namespace watson
         volatile uint32_t overflows_ = 0;
         volatile bool maintenance_ = false;
         bool running_ = false;
+        volatile bool hardwareConnected_ = true;
+        volatile bool simulateFlat_ = false;
+        FlatlineDetector flatline_;
         uint32_t seq_ = 0;
 
         int32_t raw_[kBlockSamples];

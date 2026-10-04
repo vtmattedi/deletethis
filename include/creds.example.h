@@ -28,12 +28,18 @@
 #define MQTT_PASSWD "password"
 
 // Root certificate of the broker's CA, PEM.
-// A macro, not a variable: NightMareNetwork tests it with #ifndef.
-#define ROOT_CA R"EOF(
------BEGIN CERTIFICATE-----
-...
------END CERTIFICATE-----
-)EOF"
+// A macro, not a variable: NightMareNetwork tests it with #ifndef. Written as
+// adjacent string literals (not a raw string) so editors highlight it.
+#define ROOT_CA \
+    "-----BEGIN CERTIFICATE-----\n" \
+    "...\n" \
+    "-----END CERTIFICATE-----\n"
+
+// ESP-NOW network key: 16-64 bytes, the same as the NightMare gateway's
+// NM_ESPNOW_PSK. A wrong key is not fatal -- the gateway rejects the AUTH, the
+// device backs off, and after failover_secs it falls back to MQTT -- but the
+// device will not connect over ESP-NOW until it matches.
+#define NM_ESPNOW_PSK "REPLACE-WITH-GATEWAY-PSK"
 
 // --- Watson ---
 #define WIFI_SSID     DEFAULT_SSID
