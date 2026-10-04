@@ -97,3 +97,6 @@ Desktop.ini
 /.claude
 tools/audio/results/*
 !tools/audio/results/.gitkeep
+# Watson validation: scratch data and the Linux host-test binary.
+validation/.cache/
+validation/host/replay
